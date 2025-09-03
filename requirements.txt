@@ -2,3 +2,7 @@ streamlit
 pandas
 openpyxl
 xlsxwriter
+requests>=2.31
+beautifulsoup4>=4.12
+tldextract>=5.1
+rapidfuzz>=3.9
