@@ -39,7 +39,6 @@ def _guess(colmap, patterns):
     return None
 
 def read_excel_with_options(uploaded_file, sheet_name=None, skiprows=0):
-    """Read Excel allowing sheet selection and header rows to skip."""
     if not uploaded_file:
         return None
     return pd.read_excel(uploaded_file, sheet_name=sheet_name, skiprows=skiprows)
@@ -50,12 +49,26 @@ def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Sheet1")
     return buf.getvalue()
 
+def coalesce_duplicate_named_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """
+    If multiple columns share the same name, keep a single 'name' column
+    using the first non-null value across the duplicates (left-to-right).
+    """
+    cols = [c for c in df.columns if c == name]
+    if len(cols) <= 1:
+        return df
+    dup = df.loc[:, cols]                       # duplicates as a small DataFrame
+    ser = dup.bfill(axis=1).iloc[:, 0]          # take first non-null across dup cols
+    df = df.drop(columns=[name])                # drop all occurrences of 'name'
+    df[name] = ser                              # re-add one canonical column
+    return df
+
 # ---------- Uploads ----------
 st.sidebar.header("Upload files")
 members_file = st.sidebar.file_uploader("Member list (.xlsx)", type=["xlsx"])
 answer_file  = st.sidebar.file_uploader("Specialty answer list (.xlsx)", type=["xlsx"])
 
-# New: sheet pickers + skiprows
+# Sheet pickers + skiprows
 members_df = None
 answer_df  = None
 
@@ -64,7 +77,8 @@ if members_file:
         xls_m = pd.ExcelFile(members_file)
         st.sidebar.subheader("Members file options")
         m_sheet = st.sidebar.selectbox("Members sheet", xls_m.sheet_names, index=0, key="m_sheet")
-        m_skip  = st.sidebar.number_input("Rows to skip before header (members)", min_value=0, max_value=200, value=0, step=1, key="m_skip")
+        m_skip  = st.sidebar.number_input("Rows to skip before header (members)",
+                                          min_value=0, max_value=200, value=0, step=1, key="m_skip")
         members_df = read_excel_with_options(members_file, sheet_name=m_sheet, skiprows=m_skip)
     except Exception as e:
         st.sidebar.error(f"Members file error: {e}")
@@ -74,7 +88,8 @@ if answer_file:
         xls_a = pd.ExcelFile(answer_file)
         st.sidebar.subheader("Answer list options")
         a_sheet = st.sidebar.selectbox("Answer list sheet", xls_a.sheet_names, index=0, key="a_sheet")
-        a_skip  = st.sidebar.number_input("Rows to skip before header (answer list)", min_value=0, max_value=200, value=0, step=1, key="a_skip")
+        a_skip  = st.sidebar.number_input("Rows to skip before header (answer list)",
+                                          min_value=0, max_value=200, value=0, step=1, key="a_skip")
         answer_df = read_excel_with_options(answer_file, sheet_name=a_sheet, skiprows=a_skip)
     except Exception as e:
         st.sidebar.error(f"Answer list error: {e}")
@@ -115,13 +130,16 @@ if members_df is not None and answer_df is not None:
     st.sidebar.divider()
     st.sidebar.subheader("Specialty mapping")
     members_specialty_default = members_df.columns[18] if members_df.shape[1] > 18 else None
-    members_specialty_col = st.sidebar.selectbox("Members column to MATCH against Answer List",
-                                                 options=opts, index=idx(opts, members_specialty_default))
+    members_specialty_col = st.sidebar.selectbox(
+        "Members column to MATCH against Answer List",
+        options=opts, index=idx(opts, members_specialty_default)
+    )
     if len(answer_df.columns) < 2:
         st.error("Answer list must have at least two columns: one to return, one to match on.")
         st.stop()
     answer_return_col = st.sidebar.selectbox("Answer list column to RETURN", options=list(answer_df.columns), index=0)
-    answer_match_col  = st.sidebar.selectbox("Answer list column to MATCH ON", options=list(answer_df.columns), index=min(1, len(answer_df.columns)-1))
+    answer_match_col  = st.sidebar.selectbox("Answer list column to MATCH ON", options=list(answer_df.columns),
+                                             index=min(1, len(answer_df.columns)-1))
 
     st.divider()
     if st.button("Run Cleaning", type="primary"):
@@ -136,6 +154,14 @@ if members_df is not None and answer_df is not None:
         if code_col:  df.rename(columns={code_col: "Code"}, inplace=True)
         if addr_type_col: df.rename(columns={addr_type_col: "Address type"}, inplace=True)
         if addr_type_desc_col: df.rename(columns={addr_type_desc_col: "Address type description"}, inplace=True)
+
+        # NEW: coalesce duplicate columns created by mapping
+        dupe_counts = pd.Series(df.columns).value_counts()
+        dupes = dupe_counts[dupe_counts > 1]
+        if not dupes.empty:
+            st.warning(f"Found duplicate columns after mapping: {', '.join(dupes.index.tolist())}. Coalescing.")
+            for name in dupes.index.tolist():
+                df = coalesce_duplicate_named_column(df, name)
 
         # Normalize ZIP
         if "Zip code" in df.columns:
@@ -224,3 +250,4 @@ if members_df is not None and answer_df is not None:
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
+
