@@ -12,12 +12,13 @@ st.caption("Clean and prepare member lists for GlueUp import — with previews, 
 with st.expander("How this works", expanded=True):
     st.markdown("""
 - Upload your **member list** and **specialty answer list** (Excel).
-- Confirm/adjust column mappings in the sidebar (auto-detected).
+- Choose the correct **sheet** (and optionally header **skiprows**) in the sidebar.
+- Confirm/adjust column mappings (auto-detected).
 - Click **Run Cleaning** to:
-  - Rename/canonicalize key columns (Email, Start Date, End Date, Address, Zip, Code)
+  - Canonicalize key columns (Email, Start Date, End Date, Address, Zip, Code)
   - Normalize ZIPs to 5 digits
-  - Lowercase **Code** and address types (and hyphenate Address type description)
-  - Map **specialties** by matching a chosen members column to the selected column in the answer list; returns the chosen value column from the answer list
+  - Lowercase **Code** and address types (hyphenate Address type description)
+  - Map **specialties** (choose members column to match; choose return/match columns from answer list)
   - Set **End Date = 12/31/2099** if **Code** starts with “L”
   - Backfill missing **Start Date** with **Feb 1 two years before End Date**
   - Split outputs into **Cleaned_Members_for_GlueUp.xlsx** and **Members_Missing_Emails.xlsx**
@@ -31,17 +32,17 @@ def _normalize_cols(cols):
     return {c: norm(c) for c in cols}
 
 def _guess(colmap, patterns):
-    """Return first original column whose normalized form matches any pattern."""
     for orig, norm in colmap.items():
         for pat in patterns:
             if re.search(pat, norm):
                 return orig
     return None
 
-def load_excel(uploaded) -> pd.DataFrame | None:
-    if not uploaded:
+def read_excel_with_options(uploaded_file, sheet_name=None, skiprows=0):
+    """Read Excel allowing sheet selection and header rows to skip."""
+    if not uploaded_file:
         return None
-    return pd.read_excel(uploaded)
+    return pd.read_excel(uploaded_file, sheet_name=sheet_name, skiprows=skiprows)
 
 def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
@@ -54,10 +55,31 @@ st.sidebar.header("Upload files")
 members_file = st.sidebar.file_uploader("Member list (.xlsx)", type=["xlsx"])
 answer_file  = st.sidebar.file_uploader("Specialty answer list (.xlsx)", type=["xlsx"])
 
-if members_file and answer_file:
-    members_df = load_excel(members_file)
-    answer_df  = load_excel(answer_file)
+# New: sheet pickers + skiprows
+members_df = None
+answer_df  = None
 
+if members_file:
+    try:
+        xls_m = pd.ExcelFile(members_file)
+        st.sidebar.subheader("Members file options")
+        m_sheet = st.sidebar.selectbox("Members sheet", xls_m.sheet_names, index=0, key="m_sheet")
+        m_skip  = st.sidebar.number_input("Rows to skip before header (members)", min_value=0, max_value=200, value=0, step=1, key="m_skip")
+        members_df = read_excel_with_options(members_file, sheet_name=m_sheet, skiprows=m_skip)
+    except Exception as e:
+        st.sidebar.error(f"Members file error: {e}")
+
+if answer_file:
+    try:
+        xls_a = pd.ExcelFile(answer_file)
+        st.sidebar.subheader("Answer list options")
+        a_sheet = st.sidebar.selectbox("Answer list sheet", xls_a.sheet_names, index=0, key="a_sheet")
+        a_skip  = st.sidebar.number_input("Rows to skip before header (answer list)", min_value=0, max_value=200, value=0, step=1, key="a_skip")
+        answer_df = read_excel_with_options(answer_file, sheet_name=a_sheet, skiprows=a_skip)
+    except Exception as e:
+        st.sidebar.error(f"Answer list error: {e}")
+
+if members_df is not None and answer_df is not None:
     st.subheader("Preview")
     c1, c2 = st.columns(2)
     with c1:
@@ -67,42 +89,34 @@ if members_file and answer_file:
         st.markdown("**Answer List (first 200 rows)**")
         st.dataframe(answer_df.head(200), use_container_width=True)
 
-    # ---------- Auto-detect columns with fuzzy matching ----------
+    # ---------- Auto-detect columns ----------
     norm_map = _normalize_cols(members_df.columns)
-
     email_guess   = _guess(norm_map, [r'\bemail\b', r'\bprimary\s*email\b', r'\bemail\s*address\b'])
     start_guess   = _guess(norm_map, [r'\bmember\s*date\b', r'\bstart\b'])
     end_guess     = _guess(norm_map, [r'\bexpiration\b|\bexpire\b|\bend\s*date\b'])
-    address_guess = _guess(norm_map, [r'\baddress1?\b', r'\baddress\s*line\s*1\b'])
     zip_guess     = _guess(norm_map, [r'\bzip\b|\bpostal\b'])
     code_guess    = _guess(norm_map, [r'\bcode\b|\bmember\s*type\b|\bcategory\b'])
     addr_type_guess = _guess(norm_map, [r'\baddress\s*type\b'])
     addr_type_desc_guess = _guess(norm_map, [r'\baddress\s*type\s*description\b|\baddress\s*desc'])
 
     st.sidebar.header("Column mapping (auto-detected; you can override)")
-    email_col   = st.sidebar.selectbox("Email column", options=[None] + list(members_df.columns),
-                                       index=(0 if email_guess is None else list([None]+list(members_df.columns)).index(email_guess)))
-    start_col   = st.sidebar.selectbox("Start Date column", options=[None] + list(members_df.columns),
-                                       index=(0 if start_guess is None else list([None]+list(members_df.columns)).index(start_guess)))
-    end_col     = st.sidebar.selectbox("End Date column", options=[None] + list(members_df.columns),
-                                       index=(0 if end_guess is None else list([None]+list(members_df.columns)).index(end_guess)))
-    zip_col     = st.sidebar.selectbox("ZIP/Postal column", options=[None] + list(members_df.columns),
-                                       index=(0 if zip_guess is None else list([None]+list(members_df.columns)).index(zip_guess)))
-    code_col    = st.sidebar.selectbox("Code / Member Type column", options=[None] + list(members_df.columns),
-                                       index=(0 if code_guess is None else list([None]+list(members_df.columns)).index(code_guess)))
-    addr_type_col = st.sidebar.selectbox("Address type column (optional)", options=[None] + list(members_df.columns),
-                                         index=(0 if addr_type_guess is None else list([None]+list(members_df.columns)).index(addr_type_guess)))
-    addr_type_desc_col = st.sidebar.selectbox("Address type description column (optional)", options=[None] + list(members_df.columns),
-                                              index=(0 if addr_type_desc_guess is None else list([None]+list(members_df.columns)).index(addr_type_desc_guess)))
+    def idx(opt_list, val):  # helper for selectbox default
+        return 0 if val is None else opt_list.index(val)
+
+    opts = [None] + list(members_df.columns)
+    email_col   = st.sidebar.selectbox("Email column", options=opts, index=idx(opts, email_guess))
+    start_col   = st.sidebar.selectbox("Start Date column", options=opts, index=idx(opts, start_guess))
+    end_col     = st.sidebar.selectbox("End Date column", options=opts, index=idx(opts, end_guess))
+    zip_col     = st.sidebar.selectbox("ZIP/Postal column", options=opts, index=idx(opts, zip_guess))
+    code_col    = st.sidebar.selectbox("Code / Member Type column", options=opts, index=idx(opts, code_guess))
+    addr_type_col = st.sidebar.selectbox("Address type column (optional)", options=opts, index=idx(opts, addr_type_guess))
+    addr_type_desc_col = st.sidebar.selectbox("Address type description column (optional)", options=opts, index=idx(opts, addr_type_desc_guess))
 
     st.sidebar.divider()
     st.sidebar.subheader("Specialty mapping")
     members_specialty_default = members_df.columns[18] if members_df.shape[1] > 18 else None
-    members_specialty_col = st.sidebar.selectbox(
-        "Members column to MATCH against Answer List",
-        options=[None] + list(members_df.columns),
-        index=(0 if members_specialty_default is None else list([None]+list(members_df.columns)).index(members_specialty_default))
-    )
+    members_specialty_col = st.sidebar.selectbox("Members column to MATCH against Answer List",
+                                                 options=opts, index=idx(opts, members_specialty_default))
     if len(answer_df.columns) < 2:
         st.error("Answer list must have at least two columns: one to return, one to match on.")
         st.stop()
@@ -157,8 +171,7 @@ if members_file and answer_file:
             log["End dates set to 2099 (Code=L*)"] = count_l
 
         # Fill Start Date if missing -> Feb 1 two years prior to End Date
-        backfilled_counter = {"count": 0}  # <-- FIX: mutable counter instead of nonlocal/global
-
+        backfilled_counter = {"count": 0}
         if "Start Date" in df.columns:
             def fill_start(row):
                 raw = row.get("Start Date")
@@ -171,9 +184,7 @@ if members_file and answer_file:
                     return pd.NaT
                 parsed = pd.to_datetime(raw, errors="coerce")
                 return parsed
-
             df["Start Date"] = df.apply(fill_start, axis=1)
-
         log["Start dates backfilled"] = int(backfilled_counter["count"])
 
         # Split by Email presence
@@ -204,18 +215,12 @@ if members_file and answer_file:
         cdl, mdl = to_xlsx_bytes(cleaned_df), to_xlsx_bytes(missing_df)
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button(
-                "Download Cleaned_Members_for_GlueUp.xlsx",
-                data=cdl,
-                file_name="Cleaned_Members_for_GlueUp.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            st.download_button("Download Cleaned_Members_for_GlueUp.xlsx",
+                               data=cdl, file_name="Cleaned_Members_for_GlueUp.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with d2:
-            st.download_button(
-                "Download Members_Missing_Emails.xlsx",
-                data=mdl,
-                file_name="Members_Missing_Emails.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            st.download_button("Download Members_Missing_Emails.xlsx",
+                               data=mdl, file_name="Members_Missing_Emails.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Upload both files in the sidebar to begin.")
+    st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
