@@ -4,7 +4,7 @@ import os
 import pandas as pd
 import streamlit as st
 from datetime import datetime
-from email_enrichment_util import email_enrichment_sidebar
+
 
 st.set_page_config(page_title="GlueUp Member Upload Cleaner", layout="wide")
 
@@ -161,39 +161,6 @@ if members_df is not None and answer_df is not None:
     answer_return_col = st.sidebar.selectbox("Answer list column to RETURN", options=list(answer_df.columns), index=0)
     answer_match_col  = st.sidebar.selectbox("Answer list column to MATCH ON", options=list(answer_df.columns),
                                              index=min(1, len(answer_df.columns)-1))
-# === Email Enrichment (beta) — place just BEFORE the divider that precedes "Run Cleaning" ===
-with st.sidebar.expander("🔎 Email Enrichment (beta)", expanded=False):
-    if "members_df" in locals() and members_df is not None:
-        # Work on a view with canonical 'Email' column, regardless of mapped name
-        view_df = members_df.copy()
-        try:
-            if 'email_col' in locals() and email_col and email_col != "Email" and email_col in view_df.columns:
-                view_df["Email"] = view_df[email_col]
-            elif "Email" not in view_df.columns:
-                view_df["Email"] = ""
-        except Exception:
-            # Ensure Email column exists even if mapping not set yet
-            if "Email" not in view_df.columns:
-                view_df["Email"] = ""
-
-        # Launch enrichment UI (requires SerpAPI or Google CSE secrets)
-        email_enrichment_sidebar(view_df)
-
-        # Sync enriched emails back to whichever column the user mapped as Email
-        if st.button("↩️ Sync enriched emails to selected Email column"):
-            target_col = email_col if ('email_col' in locals() and email_col) else "Email"
-            if target_col not in members_df.columns:
-                members_df[target_col] = ""
-            # Copy back
-            if "Email" in view_df.columns:
-                members_df[target_col] = view_df["Email"]
-                st.success(f"Synced enriched emails into '{target_col}'. You can now click 'Run Cleaning'.")
-            else:
-                st.warning("No 'Email' column present in enrichment view.")
-    else:
-        st.info("Upload your Members file first to enable enrichment.")
-# === End Email Enrichment (beta) ===
-
 
     st.divider()
     if st.button("Run Cleaning", type="primary"):
