@@ -1,4 +1,5 @@
 import io
+import re
 import pandas as pd
 import streamlit as st
 from datetime import datetime
@@ -6,113 +7,52 @@ from datetime import datetime
 st.set_page_config(page_title="GlueUp Member Upload Cleaner", layout="wide")
 
 st.title("GlueUp Member Upload Cleaner")
-st.caption("Clean and prepare member lists for GlueUp import — with previews and exports.")
+st.caption("Clean and prepare member lists for GlueUp import — with previews, mapping, and exports.")
 
 with st.expander("How this works", expanded=True):
     st.markdown("""
 - Upload your **member list** and **specialty answer list** (Excel).
-- The app will:
-  - Rename common columns (Primary Email→Email, Member Date→Start Date, Address1→Address, Expiration Date→End Date)
+- Confirm/adjust column mappings in the sidebar (auto-detected).
+- Click **Run Cleaning** to:
+  - Rename/canonicalize key columns (Email, Start Date, End Date, Address, Zip, Code)
   - Normalize ZIPs to 5 digits
-  - Lowercase **Code** and address types
-  - Map **specialties** by matching a chosen members column to the **second column** in the answer list; returns the **first column** from the answer list as the mapped code/value
-  - Set **End Date = 12/31/2099** if **Code** starts with 'L'
-  - Fill missing **Start Date** with **Feb 1 two years before End Date**
+  - Lowercase **Code** and address types (and hyphenate Address type description)
+  - Map **specialties** by matching a chosen members column to the selected column in the answer list; returns the chosen value column from the answer list
+  - Set **End Date = 12/31/2099** if **Code** starts with “L”
+  - Backfill missing **Start Date** with **Feb 1 two years before End Date**
   - Split outputs into **Cleaned_Members_for_GlueUp.xlsx** and **Members_Missing_Emails.xlsx**
 """)
 
-st.sidebar.header("Upload files")
-members_file = st.sidebar.file_uploader("Member list (.xlsx)", type=["xlsx"])
-answer_file  = st.sidebar.file_uploader("Specialty answer list (.xlsx)", type=["xlsx"])
+# ---------- Helpers ----------
+def _normalize_cols(cols):
+    def norm(c):
+        c = str(c).strip()
+        return re.sub(r'[^a-z0-9]+', ' ', c.lower()).strip()
+    return {c: norm(c) for c in cols}
 
-def load_excel(uploaded) -> pd.DataFrame:
+def _guess(colmap, patterns):
+    """Return first original column whose normalized form matches any pattern."""
+    for orig, norm in colmap.items():
+        for pat in patterns:
+            if re.search(pat, norm):
+                return orig
+    return None
+
+def load_excel(uploaded) -> pd.DataFrame | None:
     if not uploaded:
         return None
     return pd.read_excel(uploaded)
 
-def clean_and_process(members_df: pd.DataFrame, answer_df: pd.DataFrame,
-                      members_specialty_col: str | None,
-                      answer_key_col: str, answer_match_col: str):
-    # 1) Rename common columns
-    rename_map = {}
-    for col in members_df.columns:
-        low = str(col).strip().lower()
-        if low == 'primary email':
-            rename_map[col] = 'Email'
-        elif low == 'member date':
-            rename_map[col] = 'Start Date'
-        elif low == 'address1':
-            rename_map[col] = 'Address'
-        elif low == 'expiration date':
-            rename_map[col] = 'End Date'
-    members_df = members_df.rename(columns=rename_map).copy()
+def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Sheet1")
+    return buf.getvalue()
 
-    # 2) Format ZIP as 5-char with leading zeros if present
-    if 'Zip code' in members_df.columns:
-        members_df['Zip code'] = members_df['Zip code'].astype(str).str.replace(r'\D', '', regex=True).str.zfill(5)
-
-    # 3) Lowercase select text fields
-    if 'Code' in members_df.columns:
-        members_df['Code'] = members_df['Code'].astype(str).str.lower()
-    for col in ['Address type', 'Address type description']:
-        if col in members_df.columns:
-            members_df[col] = members_df[col].astype(str).str.lower()
-    if 'Address type description' in members_df.columns:
-        members_df['Address type description'] = members_df['Address type description'].str.replace(' ', '-', regex=False)
-
-    # 4) Specialty mapping (VLOOKUP-style). Default behavior = use members col index 18 (“column S”) if the user doesn’t choose.
-    # Answer list: return answer_key_col by matching members_specialty_col to answer_match_col.
-    # Drop NA in match col to avoid bad index entries.
-    answer_df_clean = answer_df.dropna(subset=[answer_match_col]).copy()
-
-    if members_specialty_col is None:
-        # Fall back to column S (0-based index 18) if it exists
-        if members_df.shape[1] > 18:
-            specialty_series = members_df.iloc[:, 18]
-        else:
-            specialty_series = pd.Series([None] * len(members_df))
-    else:
-        specialty_series = members_df[members_specialty_col] if members_specialty_col in members_df.columns else pd.Series([None]*len(members_df))
-
-    mapper = answer_df_clean.set_index(answer_match_col)[answer_key_col]
-    members_df['Specialty Description - 1'] = specialty_series.map(mapper)
-
-    # 5) End Date to 2099-12-31 where Code starts with 'l'
-    if 'Code' in members_df.columns and 'End Date' in members_df.columns:
-        mask_l = members_df['Code'].astype(str).str.startswith('l', na=False)
-        members_df.loc[mask_l, 'End Date'] = pd.Timestamp('2099-12-31')
-
-    # 6) Fill Start Date if blank -> Feb 1 two years prior to End Date
-    def fill_start(row):
-        raw = row.get('Start Date')
-        is_blank = (pd.isna(raw) or str(raw).strip().lower() in ['', 'none', 'nan'])
-        if is_blank:
-            end_date = pd.to_datetime(row.get('End Date'), errors='coerce')
-            if pd.notnull(end_date):
-                return pd.Timestamp(year=end_date.year - 2, month=2, day=1)
-            return ''
-        parsed = pd.to_datetime(raw, errors='coerce')
-        return parsed if pd.notnull(parsed) else ''
-
-    if 'Start Date' in members_df.columns:
-        members_df['Start Date'] = members_df.apply(fill_start, axis=1)
-
-    # 7) Require Email, split outputs
-    if 'Email' not in members_df.columns:
-        raise KeyError("Expected 'Email' column is missing after renaming. Make sure your file has 'Primary Email' or 'Email'.")
-
-    is_blank_email = members_df['Email'].isna() | (members_df['Email'].astype(str).str.strip() == '')
-    missing_email_df = members_df[is_blank_email].copy()
-    cleaned_df = members_df[~is_blank_email].copy()
-
-    # Return dataframes + bytes for download
-    def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Sheet1")
-        return buf.getvalue()
-
-    return cleaned_df, missing_email_df, to_xlsx_bytes(cleaned_df), to_xlsx_bytes(missing_email_df)
+# ---------- Uploads ----------
+st.sidebar.header("Upload files")
+members_file = st.sidebar.file_uploader("Member list (.xlsx)", type=["xlsx"])
+answer_file  = st.sidebar.file_uploader("Specialty answer list (.xlsx)", type=["xlsx"])
 
 if members_file and answer_file:
     members_df = load_excel(members_file)
@@ -127,52 +67,149 @@ if members_file and answer_file:
         st.markdown("**Answer List (first 200 rows)**")
         st.dataframe(answer_df.head(200), use_container_width=True)
 
-    st.divider()
-    st.subheader("Mapping Options (optional)")
+    # ---------- Auto-detect columns with fuzzy matching ----------
+    norm_map = _normalize_cols(members_df.columns)
 
-    # Members specialty column selection (optional)
-    members_specialty_col = st.selectbox(
-        "Members column to match against the Answer List’s match column (defaults to column S if not selected)",
-        options=["(auto: column S / index 18)"] + list(members_df.columns),
-        index=0
+    # Guesses (broad patterns)
+    email_guess   = _guess(norm_map, [r'\bemail\b', r'\bprimary\s*email\b', r'\bemail\s*address\b'])
+    start_guess   = _guess(norm_map, [r'\bmember\s*date\b', r'\bstart\b'])
+    end_guess     = _guess(norm_map, [r'\bexpiration\b|\bexpire\b|\bend\s*date\b'])
+    address_guess = _guess(norm_map, [r'\baddress1?\b', r'\baddress\s*line\s*1\b'])
+    zip_guess     = _guess(norm_map, [r'\bzip\b|\bpostal\b'])
+    code_guess    = _guess(norm_map, [r'\bcode\b|\bmember\s*type\b|\bcategory\b'])
+    addr_type_guess = _guess(norm_map, [r'\baddress\s*type\b'])
+    addr_type_desc_guess = _guess(norm_map, [r'\baddress\s*type\s*description\b|\baddress\s*desc'])
+
+    st.sidebar.header("Column mapping (auto-detected; you can override)")
+    email_col   = st.sidebar.selectbox("Email column", options=[None] + list(members_df.columns), index=(0 if email_guess is None else list([None]+list(members_df.columns)).index(email_guess)))
+    start_col   = st.sidebar.selectbox("Start Date column", options=[None] + list(members_df.columns), index=(0 if start_guess is None else list([None]+list(members_df.columns)).index(start_guess)))
+    end_col     = st.sidebar.selectbox("End Date column", options=[None] + list(members_df.columns), index=(0 if end_guess is None else list([None]+list(members_df.columns)).index(end_guess)))
+    zip_col     = st.sidebar.selectbox("ZIP/Postal column", options=[None] + list(members_df.columns), index=(0 if zip_guess is None else list([None]+list(members_df.columns)).index(zip_guess)))
+    code_col    = st.sidebar.selectbox("Code / Member Type column", options=[None] + list(members_df.columns), index=(0 if code_guess is None else list([None]+list(members_df.columns)).index(code_guess)))
+    addr_type_col = st.sidebar.selectbox("Address type column (optional)", options=[None] + list(members_df.columns), index=(0 if addr_type_guess is None else list([None]+list(members_df.columns)).index(addr_type_guess)))
+    addr_type_desc_col = st.sidebar.selectbox("Address type description column (optional)", options=[None] + list(members_df.columns), index=(0 if addr_type_desc_guess is None else list([None]+list(members_df.columns)).index(addr_type_desc_guess)))
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Specialty mapping")
+    # Members specialty column (default = column S / index 18 if present)
+    members_specialty_default = members_df.columns[18] if members_df.shape[1] > 18 else None
+    members_specialty_col = st.sidebar.selectbox(
+        "Members column to MATCH against Answer List",
+        options=[None] + list(members_df.columns),
+        index=(0 if members_specialty_default is None else list([None]+list(members_df.columns)).index(members_specialty_default))
     )
-    members_specialty_col = None if members_specialty_col.startswith("(auto") else members_specialty_col
-
-    # Answer list columns: first = returned value (key), second = match column (default = first two columns)
+    # Answer list columns
     if len(answer_df.columns) < 2:
-        st.error("Answer list must have at least two columns: first is the value to return, second is the value to match.")
-    else:
-        answer_key_col = st.selectbox("Answer list column to RETURN (default = first column)", options=list(answer_df.columns), index=0)
-        answer_match_col = st.selectbox("Answer list column to MATCH ON (default = second column)", options=list(answer_df.columns), index=1)
+        st.error("Answer list must have at least two columns: one to return, one to match on.")
+        st.stop()
+    answer_return_col = st.sidebar.selectbox("Answer list column to RETURN", options=list(answer_df.columns), index=0)
+    answer_match_col  = st.sidebar.selectbox("Answer list column to MATCH ON", options=list(answer_df.columns), index=min(1, len(answer_df.columns)-1))
 
     st.divider()
     if st.button("Run Cleaning", type="primary"):
-        try:
-            cleaned_df, missing_df, cleaned_bytes, missing_bytes = clean_and_process(
-                members_df, answer_df, members_specialty_col, answer_key_col, answer_match_col
+        df = members_df.copy()
+        log = {}
+
+        # Canonical headers (keep originals, just create standard aliases)
+        if email_col: df.rename(columns={email_col: "Email"}, inplace=True)
+        if start_col: df.rename(columns={start_col: "Start Date"}, inplace=True)
+        if end_col:   df.rename(columns={end_col: "End Date"}, inplace=True)
+        if zip_col:   df.rename(columns={zip_col: "Zip code"}, inplace=True)
+        if code_col:  df.rename(columns={code_col: "Code"}, inplace=True)
+        if addr_type_col: df.rename(columns={addr_type_col: "Address type"}, inplace=True)
+        if addr_type_desc_col: df.rename(columns={addr_type_desc_col: "Address type description"}, inplace=True)
+
+        # Normalize ZIP
+        if "Zip code" in df.columns:
+            before = df["Zip code"].notna().sum()
+            df["Zip code"] = df["Zip code"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+            log["ZIP normalized"] = before
+
+        # Lowercase address type(s)
+        for col in ["Address type", "Address type description"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.lower()
+        if "Address type description" in df.columns:
+            df["Address type description"] = df["Address type description"].str.replace(" ", "-", regex=False)
+
+        # Lowercase Code
+        if "Code" in df.columns:
+            df["Code"] = df["Code"].astype(str).str.lower()
+
+        # Specialty mapping
+        spec_mapped = 0
+        if members_specialty_col and (members_specialty_col in df.columns):
+            ans = answer_df.dropna(subset=[answer_match_col]).copy()
+            mapper = ans.set_index(answer_match_col)[answer_return_col]
+            df["Specialty Description - 1"] = df[members_specialty_col].map(mapper)
+            spec_mapped = df["Specialty Description - 1"].notna().sum()
+        log["Specialties mapped"] = spec_mapped
+
+        # End Date = 2099-12-31 if Code starts with 'l'
+        if "Code" in df.columns and "End Date" in df.columns:
+            mask_l = df["Code"].astype(str).str.startswith("l", na=False)
+            count_l = mask_l.sum()
+            df.loc[mask_l, "End Date"] = pd.Timestamp("2099-12-31")
+            log["End dates set to 2099 (Code=L*)"] = int(count_l)
+
+        # Fill Start Date if missing -> Feb 1 two years prior to End Date
+        backfilled = 0
+        if "Start Date" in df.columns:
+            def fill_start(row):
+                nonlocal backfilled
+                raw = row.get("Start Date")
+                is_blank = (pd.isna(raw) or str(raw).strip().lower() in ["", "none", "nan"])
+                if is_blank:
+                    end_dt = pd.to_datetime(row.get("End Date"), errors="coerce")
+                    if pd.notnull(end_dt):
+                        backfilled += 1
+                        return pd.Timestamp(year=end_dt.year - 2, month=2, day=1)
+                    return pd.NaT
+                parsed = pd.to_datetime(raw, errors="coerce")
+                return parsed
+            df["Start Date"] = df.apply(fill_start, axis=1)
+        log["Start dates backfilled"] = int(backfilled)
+
+        # Split by Email presence
+        if "Email" not in df.columns:
+            st.error("No Email column found. Use the sidebar to map your email column.")
+            st.stop()
+
+        missing_mask = df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")
+        missing_df = df[missing_mask].copy()
+        cleaned_df = df[~missing_mask].copy()
+
+        # Summary
+        st.success("Processing complete.")
+        st.markdown(f"""
+**Rows total:** {len(df)}  
+**Rows with email (cleaned):** {len(cleaned_df)}  
+**Rows missing email:** {len(missing_df)}  
+**Start dates backfilled:** {log.get("Start dates backfilled", 0)}  
+**End dates → 2099 (Code starts with 'L'):** {log.get("End dates set to 2099 (Code=L*)", 0)}  
+**Specialties mapped:** {log.get("Specialties mapped", 0)}  
+**ZIPs normalized (had a value):** {log.get("ZIP normalized", 0)}
+""")
+
+        st.markdown("**Cleaned Output Preview (first 200)**")
+        st.dataframe(cleaned_df.head(200), use_container_width=True)
+
+        # Downloads (always present)
+        cdl, mdl = to_xlsx_bytes(cleaned_df), to_xlsx_bytes(missing_df)
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "Download Cleaned_Members_for_GlueUp.xlsx",
+                data=cdl,
+                file_name="Cleaned_Members_for_GlueUp.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-            st.success(f"Done! Retained {len(cleaned_df)} rows with Email; {len(missing_df)} rows missing Email.")
-            st.markdown("**Cleaned Output Preview**")
-            st.dataframe(cleaned_df.head(200), use_container_width=True)
-
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "Download Cleaned_Members_for_GlueUp.xlsx",
-                    data=cleaned_bytes,
-                    file_name="Cleaned_Members_for_GlueUp.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            with d2:
-                st.download_button(
-                    "Download Members_Missing_Emails.xlsx",
-                    data=missing_bytes,
-                    file_name="Members_Missing_Emails.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-        except Exception as e:
-            st.error(f"Processing failed: {e}")
-
+        with d2:
+            st.download_button(
+                "Download Members_Missing_Emails.xlsx",
+                data=mdl,
+                file_name="Members_Missing_Emails.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 else:
     st.info("Upload both files in the sidebar to begin.")
