@@ -12,7 +12,7 @@ LOGO_PATH = "logo.png"
 hdr_l, hdr_r = st.columns([1, 8])
 with hdr_l:
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=140)  # no use_column_width param
+        st.image(LOGO_PATH, width=220)  # no use_column_width param
 with hdr_r:
     st.title("GlueUp Member Upload Cleaner")
     st.caption("Clean and prepare member lists for GlueUp import — with previews, mapping, and exports.")
@@ -288,3 +288,4 @@ if st.session_state.results:
         )
 else:
     st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
+
