@@ -1,13 +1,22 @@
 import io
 import re
+import os
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 
 st.set_page_config(page_title="GlueUp Member Upload Cleaner", layout="wide")
 
+# --- Branding ---
+LOGO_PATH = "logo.png"
+top_cols = st.columns([1, 3, 1])
+with top_cols[1]:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_container_width=True)
 st.title("GlueUp Member Upload Cleaner")
 st.caption("Clean and prepare member lists for GlueUp import — with previews, mapping, and exports.")
+if os.path.exists(LOGO_PATH):
+    st.sidebar.image(LOGO_PATH, use_column_width=True)
 
 with st.expander("How this works", expanded=True):
     st.markdown("""
@@ -15,11 +24,11 @@ with st.expander("How this works", expanded=True):
 - Choose the correct **sheet** (and optionally header **skiprows**) in the sidebar.
 - Confirm/adjust column mappings (auto-detected).
 - Click **Run Cleaning** to:
-  - Canonicalize key columns (Email, Start Date, End Date, Address, Zip, Code)
+  - Canonicalize key columns (Email, Start Date, End Date, Address, Zip, **code**)
   - Normalize ZIPs to 5 digits
-  - Lowercase **Code** and address types (hyphenate Address type description)
+  - Lowercase **code** and address types (hyphenate Address type description)
   - Map **specialties** (choose members column to match; choose return/match columns from answer list)
-  - Set **End Date = 12/31/2099** if **Code** starts with “L”
+  - Set **End Date = 12/31/2099** if **code** starts with “l”
   - Backfill missing **Start Date** with **Feb 1 two years before End Date**
   - Split outputs into **Cleaned_Members_for_GlueUp.xlsx** and **Members_Missing_Emails.xlsx**
 """)
@@ -50,25 +59,26 @@ def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 def coalesce_duplicate_named_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
-    """
-    If multiple columns share the same name, keep a single 'name' column
-    using the first non-null value across the duplicates (left-to-right).
-    """
+    """If multiple columns share the same name, keep a single 'name' column
+    using the first non-null value across the duplicates (left-to-right)."""
     cols = [c for c in df.columns if c == name]
     if len(cols) <= 1:
         return df
-    dup = df.loc[:, cols]                       # duplicates as a small DataFrame
-    ser = dup.bfill(axis=1).iloc[:, 0]          # take first non-null across dup cols
-    df = df.drop(columns=[name])                # drop all occurrences of 'name'
-    df[name] = ser                              # re-add one canonical column
+    dup = df.loc[:, cols]
+    ser = dup.bfill(axis=1).iloc[:, 0]
+    df = df.drop(columns=[name])
+    df[name] = ser
     return df
+
+# ---------- Session state for persistent downloads ----------
+if "results" not in st.session_state:
+    st.session_state.results = None  # dict with cleaned_bytes, missing_bytes, cleaned_df_head, summary_text, timestamp
 
 # ---------- Uploads ----------
 st.sidebar.header("Upload files")
 members_file = st.sidebar.file_uploader("Member list (.xlsx)", type=["xlsx"])
 answer_file  = st.sidebar.file_uploader("Specialty answer list (.xlsx)", type=["xlsx"])
 
-# Sheet pickers + skiprows
 members_df = None
 answer_df  = None
 
@@ -115,8 +125,7 @@ if members_df is not None and answer_df is not None:
     addr_type_desc_guess = _guess(norm_map, [r'\baddress\s*type\s*description\b|\baddress\s*desc'])
 
     st.sidebar.header("Column mapping (auto-detected; you can override)")
-    def idx(opt_list, val):  # helper for selectbox default
-        return 0 if val is None else opt_list.index(val)
+    def idx(opt_list, val): return 0 if val is None else opt_list.index(val)
 
     opts = [None] + list(members_df.columns)
     email_col   = st.sidebar.selectbox("Email column", options=opts, index=idx(opts, email_guess))
@@ -130,10 +139,8 @@ if members_df is not None and answer_df is not None:
     st.sidebar.divider()
     st.sidebar.subheader("Specialty mapping")
     members_specialty_default = members_df.columns[18] if members_df.shape[1] > 18 else None
-    members_specialty_col = st.sidebar.selectbox(
-        "Members column to MATCH against Answer List",
-        options=opts, index=idx(opts, members_specialty_default)
-    )
+    members_specialty_col = st.sidebar.selectbox("Members column to MATCH against Answer List",
+                                                 options=opts, index=idx(opts, members_specialty_default))
     if len(answer_df.columns) < 2:
         st.error("Answer list must have at least two columns: one to return, one to match on.")
         st.stop()
@@ -146,16 +153,16 @@ if members_df is not None and answer_df is not None:
         df = members_df.copy()
         log = {}
 
-        # Canonical headers
+        # Canonical headers: NOTE 'code' is lowercase to match your downstream use
         if email_col: df.rename(columns={email_col: "Email"}, inplace=True)
         if start_col: df.rename(columns={start_col: "Start Date"}, inplace=True)
         if end_col:   df.rename(columns={end_col: "End Date"}, inplace=True)
         if zip_col:   df.rename(columns={zip_col: "Zip code"}, inplace=True)
-        if code_col:  df.rename(columns={code_col: "Code"}, inplace=True)
+        if code_col:  df.rename(columns={code_col: "code"}, inplace=True)
         if addr_type_col: df.rename(columns={addr_type_col: "Address type"}, inplace=True)
         if addr_type_desc_col: df.rename(columns={addr_type_desc_col: "Address type description"}, inplace=True)
 
-        # NEW: coalesce duplicate columns created by mapping
+        # Coalesce duplicate columns created by mapping
         dupe_counts = pd.Series(df.columns).value_counts()
         dupes = dupe_counts[dupe_counts > 1]
         if not dupes.empty:
@@ -176,9 +183,9 @@ if members_df is not None and answer_df is not None:
         if "Address type description" in df.columns:
             df["Address type description"] = df["Address type description"].str.replace(" ", "-", regex=False)
 
-        # Lowercase Code
-        if "Code" in df.columns:
-            df["Code"] = df["Code"].astype(str).str.lower()
+        # Lowercase code
+        if "code" in df.columns:
+            df["code"] = df["code"].astype(str).str.lower()
 
         # Specialty mapping
         spec_mapped = 0
@@ -189,12 +196,12 @@ if members_df is not None and answer_df is not None:
             spec_mapped = df["Specialty Description - 1"].notna().sum()
         log["Specialties mapped"] = spec_mapped
 
-        # End Date = 2099-12-31 if Code starts with 'l'
-        if "Code" in df.columns and "End Date" in df.columns:
-            mask_l = df["Code"].astype(str).str.startswith("l", na=False)
+        # End Date = 2099-12-31 if code starts with 'l'
+        if "code" in df.columns and "End Date" in df.columns:
+            mask_l = df["code"].astype(str).str.startswith("l", na=False)
             count_l = int(mask_l.sum())
             df.loc[mask_l, "End Date"] = pd.Timestamp("2099-12-31")
-            log["End dates set to 2099 (Code=L*)"] = count_l
+            log["End dates set to 2099 (code=l*)"] = count_l
 
         # Fill Start Date if missing -> Feb 1 two years prior to End Date
         backfilled_counter = {"count": 0}
@@ -222,32 +229,47 @@ if members_df is not None and answer_df is not None:
         missing_df = df[missing_mask].copy()
         cleaned_df = df[~missing_mask].copy()
 
-        # Summary
-        st.success("Processing complete.")
-        st.markdown(f"""
+        # Build outputs and store in session_state so downloads persist
+        cleaned_bytes = to_xlsx_bytes(cleaned_df)
+        missing_bytes = to_xlsx_bytes(missing_df)
+
+        summary_md = f"""
 **Rows total:** {len(df)}  
 **Rows with email (cleaned):** {len(cleaned_df)}  
 **Rows missing email:** {len(missing_df)}  
 **Start dates backfilled:** {log.get("Start dates backfilled", 0)}  
-**End dates → 2099 (Code starts with 'L'):** {log.get("End dates set to 2099 (Code=L*)", 0)}  
+**End dates → 2099 (code starts with 'l'):** {log.get("End dates set to 2099 (code=l*)", 0)}  
 **Specialties mapped:** {log.get("Specialties mapped", 0)}  
 **ZIPs normalized (had a value):** {log.get("ZIP normalized", 0)}
-""")
+"""
+        st.session_state.results = dict(
+            cleaned_bytes=cleaned_bytes,
+            missing_bytes=missing_bytes,
+            cleaned_head=cleaned_df.head(200),
+            summary_md=summary_md,
+            ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
 
+    # --- Always show persisted results if present ---
+    if st.session_state.results:
+        st.success(f"Processing complete. (Generated {st.session_state.results['ts']})")
+        st.markdown(st.session_state.results["summary_md"])
         st.markdown("**Cleaned Output Preview (first 200)**")
-        st.dataframe(cleaned_df.head(200), use_container_width=True)
+        st.dataframe(st.session_state.results["cleaned_head"], use_container_width=True)
 
-        # Downloads (always present)
-        cdl, mdl = to_xlsx_bytes(cleaned_df), to_xlsx_bytes(missing_df)
         d1, d2 = st.columns(2)
         with d1:
             st.download_button("Download Cleaned_Members_for_GlueUp.xlsx",
-                               data=cdl, file_name="Cleaned_Members_for_GlueUp.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                               data=st.session_state.results["cleaned_bytes"],
+                               file_name="Cleaned_Members_for_GlueUp.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_cleaned")
         with d2:
             st.download_button("Download Members_Missing_Emails.xlsx",
-                               data=mdl, file_name="Members_Missing_Emails.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                               data=st.session_state.results["missing_bytes"],
+                               file_name="Members_Missing_Emails.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_missing")
 else:
     st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
 
