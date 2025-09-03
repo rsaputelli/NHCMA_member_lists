@@ -7,6 +7,8 @@ from datetime import datetime
 
 
 st.set_page_config(page_title="GlueUp Member Upload Cleaner", layout="wide")
+st.write('✅ App booted · GlueUp Cleaner is running')
+
 
 # === Branding (logo left of title) ===
 LOGO_PATH = "logo.png"
@@ -18,7 +20,7 @@ with hdr_r:
     st.title("GlueUp Member Upload Cleaner")
     st.caption("Clean and prepare member lists for GlueUp import — with previews, mapping, and exports.")
 if os.path.exists(LOGO_PATH):
-    st.sidebar.image(LOGO_PATH, use_container_width=True)  # OK: new param name
+    st.sidebar.image(LOGO_PATH, width='stretch')  # OK: new param name
 
 
 with st.expander("How this works", expanded=True):
@@ -115,10 +117,10 @@ if members_df is not None and answer_df is not None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Members (first 200 rows)**")
-        st.dataframe(members_df.head(200), use_container_width=True)
+        st.dataframe(members_df.head(200), width='stretch')
     with c2:
         st.markdown("**Answer List (first 200 rows)**")
-        st.dataframe(answer_df.head(200), use_container_width=True)
+        st.dataframe(answer_df.head(200), width='stretch')
 
     # Auto-detect columns
     norm_map = _normalize_cols(members_df.columns)
@@ -268,7 +270,7 @@ if st.session_state.results:
     st.success(f"Processing complete. (Generated {st.session_state.results['ts']})")
     st.markdown(st.session_state.results["summary_md"])
     st.markdown("**Cleaned Output Preview (first 200)**")
-    st.dataframe(st.session_state.results["cleaned_head"], use_container_width=True)
+    st.dataframe(st.session_state.results["cleaned_head"], width='stretch')
 
     d1, d2 = st.columns(2)
     with d1:
