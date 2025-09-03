@@ -12,13 +12,13 @@ LOGO_PATH = "logo.png"
 hdr_l, hdr_r = st.columns([1, 8])
 with hdr_l:
     if os.path.exists(LOGO_PATH):
-        # keep this modest; adjust height as you like
-        st.image(LOGO_PATH, caption=None, use_column_width=False, width=160)
+        st.image(LOGO_PATH, width=140)  # no use_column_width param
 with hdr_r:
     st.title("GlueUp Member Upload Cleaner")
     st.caption("Clean and prepare member lists for GlueUp import — with previews, mapping, and exports.")
 if os.path.exists(LOGO_PATH):
-    st.sidebar.image(LOGO_PATH, use_column_width=True)
+    st.sidebar.image(LOGO_PATH, use_container_width=True)  # OK: new param name
+
 
 with st.expander("How this works", expanded=True):
     st.markdown("""
@@ -119,20 +119,20 @@ if members_df is not None and answer_df is not None:
         st.markdown("**Answer List (first 200 rows)**")
         st.dataframe(answer_df.head(200), use_container_width=True)
 
-    # ---------- Auto-detect columns ----------
+    # Auto-detect columns
     norm_map = _normalize_cols(members_df.columns)
-    email_guess = _guess_with_exclusions(
-        norm_map, [r'\bemail\b', r'\bprimary\s*email\b', r'\bemail\s*address\b']
-    )
+
+    email_guess = _guess_with_exclusions(norm_map, [r'\bemail\b', r'\bprimary\s*email\b', r'\bemail\s*address\b'])
     start_guess = _guess_with_exclusions(norm_map, [r'\bmember\s*date\b', r'\bstart\b'])
     end_guess   = _guess_with_exclusions(norm_map, [r'\bexpiration\b|\bexpire\b|\bend\s*date\b'])
     zip_guess   = _guess_with_exclusions(norm_map, [r'\bzip\b|\bpostal\b'])
-    # IMPORTANT: never let "zip code" satisfy the code/member-type guess
-    code_guess  = _guess_with_exclusions(
-        norm_map,
-        [r'\bmember\s*type\b', r'\bcategory\b', r'\bcode\b'],
-        exclude_contains=["zip", "postal"]   # prevents defaulting to ZIP Code
+
+    # Prefer "member type" / "category" over a bare "code", and exclude any with "zip" or "postal"
+    code_guess = (
+        _guess_with_exclusions(norm_map, [r'\bmember\s*type\b', r'\bcategory\b'], exclude_contains=["zip", "postal"])
+        or _guess_with_exclusions(norm_map, [r'\bcode\b'], exclude_contains=["zip", "postal"])
     )
+
     addr_type_guess = _guess_with_exclusions(norm_map, [r'\baddress\s*type\b'])
     addr_type_desc_guess = _guess_with_exclusions(norm_map, [r'\baddress\s*type\s*description\b|\baddress\s*desc'])
 
