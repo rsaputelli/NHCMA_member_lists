@@ -70,7 +70,6 @@ if members_file and answer_file:
     # ---------- Auto-detect columns with fuzzy matching ----------
     norm_map = _normalize_cols(members_df.columns)
 
-    # Guesses (broad patterns)
     email_guess   = _guess(norm_map, [r'\bemail\b', r'\bprimary\s*email\b', r'\bemail\s*address\b'])
     start_guess   = _guess(norm_map, [r'\bmember\s*date\b', r'\bstart\b'])
     end_guess     = _guess(norm_map, [r'\bexpiration\b|\bexpire\b|\bend\s*date\b'])
@@ -81,24 +80,29 @@ if members_file and answer_file:
     addr_type_desc_guess = _guess(norm_map, [r'\baddress\s*type\s*description\b|\baddress\s*desc'])
 
     st.sidebar.header("Column mapping (auto-detected; you can override)")
-    email_col   = st.sidebar.selectbox("Email column", options=[None] + list(members_df.columns), index=(0 if email_guess is None else list([None]+list(members_df.columns)).index(email_guess)))
-    start_col   = st.sidebar.selectbox("Start Date column", options=[None] + list(members_df.columns), index=(0 if start_guess is None else list([None]+list(members_df.columns)).index(start_guess)))
-    end_col     = st.sidebar.selectbox("End Date column", options=[None] + list(members_df.columns), index=(0 if end_guess is None else list([None]+list(members_df.columns)).index(end_guess)))
-    zip_col     = st.sidebar.selectbox("ZIP/Postal column", options=[None] + list(members_df.columns), index=(0 if zip_guess is None else list([None]+list(members_df.columns)).index(zip_guess)))
-    code_col    = st.sidebar.selectbox("Code / Member Type column", options=[None] + list(members_df.columns), index=(0 if code_guess is None else list([None]+list(members_df.columns)).index(code_guess)))
-    addr_type_col = st.sidebar.selectbox("Address type column (optional)", options=[None] + list(members_df.columns), index=(0 if addr_type_guess is None else list([None]+list(members_df.columns)).index(addr_type_guess)))
-    addr_type_desc_col = st.sidebar.selectbox("Address type description column (optional)", options=[None] + list(members_df.columns), index=(0 if addr_type_desc_guess is None else list([None]+list(members_df.columns)).index(addr_type_desc_guess)))
+    email_col   = st.sidebar.selectbox("Email column", options=[None] + list(members_df.columns),
+                                       index=(0 if email_guess is None else list([None]+list(members_df.columns)).index(email_guess)))
+    start_col   = st.sidebar.selectbox("Start Date column", options=[None] + list(members_df.columns),
+                                       index=(0 if start_guess is None else list([None]+list(members_df.columns)).index(start_guess)))
+    end_col     = st.sidebar.selectbox("End Date column", options=[None] + list(members_df.columns),
+                                       index=(0 if end_guess is None else list([None]+list(members_df.columns)).index(end_guess)))
+    zip_col     = st.sidebar.selectbox("ZIP/Postal column", options=[None] + list(members_df.columns),
+                                       index=(0 if zip_guess is None else list([None]+list(members_df.columns)).index(zip_guess)))
+    code_col    = st.sidebar.selectbox("Code / Member Type column", options=[None] + list(members_df.columns),
+                                       index=(0 if code_guess is None else list([None]+list(members_df.columns)).index(code_guess)))
+    addr_type_col = st.sidebar.selectbox("Address type column (optional)", options=[None] + list(members_df.columns),
+                                         index=(0 if addr_type_guess is None else list([None]+list(members_df.columns)).index(addr_type_guess)))
+    addr_type_desc_col = st.sidebar.selectbox("Address type description column (optional)", options=[None] + list(members_df.columns),
+                                              index=(0 if addr_type_desc_guess is None else list([None]+list(members_df.columns)).index(addr_type_desc_guess)))
 
     st.sidebar.divider()
     st.sidebar.subheader("Specialty mapping")
-    # Members specialty column (default = column S / index 18 if present)
     members_specialty_default = members_df.columns[18] if members_df.shape[1] > 18 else None
     members_specialty_col = st.sidebar.selectbox(
         "Members column to MATCH against Answer List",
         options=[None] + list(members_df.columns),
         index=(0 if members_specialty_default is None else list([None]+list(members_df.columns)).index(members_specialty_default))
     )
-    # Answer list columns
     if len(answer_df.columns) < 2:
         st.error("Answer list must have at least two columns: one to return, one to match on.")
         st.stop()
@@ -110,7 +114,7 @@ if members_file and answer_file:
         df = members_df.copy()
         log = {}
 
-        # Canonical headers (keep originals, just create standard aliases)
+        # Canonical headers
         if email_col: df.rename(columns={email_col: "Email"}, inplace=True)
         if start_col: df.rename(columns={start_col: "Start Date"}, inplace=True)
         if end_col:   df.rename(columns={end_col: "End Date"}, inplace=True)
@@ -148,27 +152,29 @@ if members_file and answer_file:
         # End Date = 2099-12-31 if Code starts with 'l'
         if "Code" in df.columns and "End Date" in df.columns:
             mask_l = df["Code"].astype(str).str.startswith("l", na=False)
-            count_l = mask_l.sum()
+            count_l = int(mask_l.sum())
             df.loc[mask_l, "End Date"] = pd.Timestamp("2099-12-31")
-            log["End dates set to 2099 (Code=L*)"] = int(count_l)
+            log["End dates set to 2099 (Code=L*)"] = count_l
 
         # Fill Start Date if missing -> Feb 1 two years prior to End Date
-        backfilled = 0
+        backfilled_counter = {"count": 0}  # <-- FIX: mutable counter instead of nonlocal/global
+
         if "Start Date" in df.columns:
             def fill_start(row):
-                nonlocal backfilled
                 raw = row.get("Start Date")
                 is_blank = (pd.isna(raw) or str(raw).strip().lower() in ["", "none", "nan"])
                 if is_blank:
                     end_dt = pd.to_datetime(row.get("End Date"), errors="coerce")
                     if pd.notnull(end_dt):
-                        backfilled += 1
+                        backfilled_counter["count"] += 1
                         return pd.Timestamp(year=end_dt.year - 2, month=2, day=1)
                     return pd.NaT
                 parsed = pd.to_datetime(raw, errors="coerce")
                 return parsed
+
             df["Start Date"] = df.apply(fill_start, axis=1)
-        log["Start dates backfilled"] = int(backfilled)
+
+        log["Start dates backfilled"] = int(backfilled_counter["count"])
 
         # Split by Email presence
         if "Email" not in df.columns:
