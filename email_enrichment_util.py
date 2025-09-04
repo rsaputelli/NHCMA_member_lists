@@ -1,11 +1,18 @@
 
 # email_enrichment_util.py — FINAL (import-safe)
-# PERSISTENT RESULTS + SERPAPI MONTHLY CAP + SKIP-NON-APPROVED + OPTIONAL PERSISTED SKIP LIST + START OFFSET
+# PERSISTENT RESULTS + SERPAPI MONTHLY CAP + SKIP-NON-APPROVED
+# + OPTIONAL PERSISTED SKIP LIST + START OFFSET + DISK-PERSISTED AUTOSAVE (RECOVER)
 #
-# Adds since prior drop:
-# • Toggle: "Persist skip list across restarts" -> writes/reads .email_enrich_skiplist.json
-# • Button: "Reset PERSISTED skipped list"
-# • New control: "Start at row N (within current candidates)" to offset into the remaining pool
+# New in this drop:
+# • Toggle: "Persist autosave to disk" (writes partial results to .email_enrich_autosave.json)
+# • Control: "Autosave persist frequency (rows)"
+# • Buttons: "Recover autosave" (load saved partials), "Clear autosave file"
+# • Atomic writes: write to .tmp then rename
+#
+# Notes:
+# - Session autosave (in-memory) still works as before.
+# - Disk autosave is optional; overhead is tiny for 25-row batches.
+# - Autosave file is NOT auto-cleared; you can clear it after Apply or when you’re done.
 
 import os, re, time, json, html, requests, io
 from typing import List, Dict, Tuple
@@ -31,6 +38,8 @@ DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 USAGE_PATH = Path(".email_enrich_usage.json")              # CSE daily
 SERP_USAGE_PATH = Path(".serpapi_usage.json")              # SerpAPI monthly
 SKIPLIST_PATH = Path(".email_enrich_skiplist.json")        # persisted skip keys
+AUTOSAVE_PATH = Path(".email_enrich_autosave.json")        # persisted partials
+AUTOSAVE_TMP = Path(".email_enrich_autosave.json.tmp")
 
 # --- tldextract offline (prevents network on first call) ---
 EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None, cache_dir=False)
@@ -94,7 +103,6 @@ def _load_persisted_skiplist():
         if SKIPLIST_PATH.exists():
             data = json.loads(SKIPLIST_PATH.read_text())
             if isinstance(data, list):
-                # ensure tuples
                 return [tuple(x) for x in data]
     except Exception:
         pass
@@ -102,11 +110,38 @@ def _load_persisted_skiplist():
 
 def _save_persisted_skiplist(keys):
     try:
-        # keys is list of tuples -> serialize as list of lists
         data = [list(t) for t in keys]
         SKIPLIST_PATH.write_text(json.dumps(data))
     except Exception:
         pass
+
+# --- autosave persistence helpers ---
+def _persist_autosave(results: list):
+    try:
+        AUTOSAVE_TMP.write_text(json.dumps(results))
+        AUTOSAVE_TMP.replace(AUTOSAVE_PATH)
+    except Exception:
+        pass
+
+def _load_autosave():
+    try:
+        if AUTOSAVE_PATH.exists():
+            data = json.loads(AUTOSAVE_PATH.read_text())
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+def _clear_autosave():
+    try:
+        if AUTOSAVE_PATH.exists():
+            AUTOSAVE_PATH.unlink()
+        if AUTOSAVE_TMP.exists():
+            AUTOSAVE_TMP.unlink()
+        return True
+    except Exception:
+        return False
 
 # --- Search backends ---
 def _search_google_cse(query: str, num: int = 5):
@@ -585,20 +620,54 @@ def email_enrichment_sidebar(df):
     persist_skip = st.toggle("Persist skip list across restarts", value=False,
                              help="Writes not-approved rows to a local JSON so they remain skipped after reloads.")
     if persist_skip and not st.session_state.get("_skip_loaded", False):
-        # Merge persisted list into session on first time enabling
         persisted = _load_persisted_skiplist()
         if persisted:
             merged = set(tuple(x) for x in st.session_state["_email_enrich_blacklist"]).union(set(persisted))
             st.session_state["_email_enrich_blacklist"] = [list(t) for t in merged]
         st.session_state["_skip_loaded"] = True
 
-    if st.button("Reset PERSISTED skipped list", key="reset_persist_blacklist", type="secondary"):
-        try:
-            if SKIPLIST_PATH.exists():
-                SKIPLIST_PATH.unlink()
-            st.success("Persisted skip list cleared (session skip list unchanged).")
-        except Exception as e:
-            st.warning(f"Could not clear persisted skip list: {e}")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("Reset PERSISTED skipped list", key="reset_persist_blacklist", type="secondary"):
+            try:
+                if SKIPLIST_PATH.exists():
+                    SKIPLIST_PATH.unlink()
+                st.success("Persisted skip list cleared (session skip list unchanged).")
+            except Exception as e:
+                st.warning(f"Could not clear persisted skip list: {e}")
+    with cols[1]:
+        if st.button("Reset skipped list (SESSION)", key="reset_blacklist", type="secondary"):
+            st.session_state["_email_enrich_blacklist"] = []
+            st.success("Session skip list cleared.")
+
+    # --- Autosave persistence controls ---
+    persist_autosave = st.toggle("Persist autosave to disk", value=False,
+                                 help="Writes partial results to disk during a run so you can recover after a restart.")
+    autosave_persist_every = 5
+    if persist_autosave:
+        autosave_persist_every = st.number_input("Autosave persist frequency (rows)", min_value=1, max_value=100, value=5, step=1)
+        if AUTOSAVE_PATH.exists():
+            try:
+                data = json.loads(AUTOSAVE_PATH.read_text())
+                count = len(data) if isinstance(data, list) else 0
+            except Exception:
+                count = 0
+            recov_cols = st.columns(2)
+            with recov_cols[0]:
+                if st.button(f"Recover autosave ({count} rows)", key="recover_autosave"):
+                    recovered = _load_autosave()
+                    if recovered:
+                        st.session_state["_enrich_partial"] = recovered
+                        st.session_state["_email_enrich_results"] = recovered
+                        st.success(f"Recovered {len(recovered)} rows from autosave.")
+                    else:
+                        st.info("No recoverable autosave found.")
+            with recov_cols[1]:
+                if st.button("Clear autosave file", key="clear_autosave"):
+                    if _clear_autosave():
+                        st.success("Autosave file cleared.")
+                    else:
+                        st.warning("Could not clear autosave file.")
 
     overwrite = st.checkbox("Overwrite existing Email values", value=False)
 
@@ -619,10 +688,6 @@ def email_enrichment_sidebar(df):
             st.caption(f"Skipping {int(mask_skip.sum())} previously attempted rows this session.")
             candidates_df = candidates_df[~mask_skip]
 
-    if st.button("Reset skipped list (SESSION)", key="reset_blacklist", type="secondary"):
-        st.session_state["_email_enrich_blacklist"] = []
-        st.success("Session skip list cleared.")
-
     # --- Batching & offsets ---
     usage = _load_usage(); cap = _get_free_cap()
     remaining = max(0, cap - int(usage.get("count", 0)))
@@ -635,7 +700,7 @@ def email_enrichment_sidebar(df):
                                    help="Offsets into the remaining candidate pool after filters & skip list are applied.")
     limit = st.number_input("Max records to scan", min_value=0, max_value=int(max(0, max_limit - start_offset)), value=int(min(default_limit, max(0, max_limit - start_offset))))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
-    autosave_every = st.number_input("Autosave every N rows", min_value=1, max_value=100, value=10, step=1)
+    autosave_every = st.number_input("Autosave every N rows (session)", min_value=1, max_value=100, value=10, step=1)
 
     # Sidebar persistent actions if results exist
     have_results = bool(st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial"))
@@ -746,8 +811,15 @@ def email_enrichment_sidebar(df):
                 "Approve": bool(res.get("Found Email") and int(res.get("Confidence",0)) >= conf_thresh),
             }
             results.append(rec)
+
+            # Session autosave
             if i % int(autosave_every) == 0:
                 st.session_state["_enrich_partial"] = results.copy()
+
+            # Disk autosave (optional)
+            if persist_autosave and i % int(autosave_persist_every) == 0:
+                _persist_autosave(results)
+
             progress.progress(i/total)
 
         if not results:
@@ -757,6 +829,9 @@ def email_enrichment_sidebar(df):
             return
 
         st.session_state["_enrich_partial"] = results.copy()
+        if persist_autosave:
+            _persist_autosave(results)
+
         # Initial editor view (immediate), then persistently render
         edited = st.data_editor(
             results,
@@ -771,5 +846,4 @@ def email_enrichment_sidebar(df):
 
     # Always show results area if any exist
     render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
-
 
