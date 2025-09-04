@@ -1,21 +1,26 @@
 
-# email_enrichment_util.py — FINAL (import-safe)
-# PERSISTENT RESULTS + SERPAPI MONTHLY CAP + SKIP-NON-APPROVED
-# + OPTIONAL PERSISTED SKIP LIST + START OFFSET + DISK-PERSISTED AUTOSAVE (RECOVER)
-#
-# New in this drop:
-# • Toggle: "Persist autosave to disk" (writes partial results to .email_enrich_autosave.json)
-# • Control: "Autosave persist frequency (rows)"
-# • Buttons: "Recover autosave" (load saved partials), "Clear autosave file"
-# • Atomic writes: write to .tmp then rename
+# email_enrichment_util.py — FULL + Live SerpAPI usage (Account API)
+# This build includes everything from the previous drop plus:
+# • Live SerpAPI usage via https://serpapi.com/account.json (free; not counted against quota)
+# • Sidebar shows: used this month, plan limit, remaining, last-hour searches, hourly cap
+# • Optional limiter uses LIVE remaining instead of a local counter (falls back if API unreachable)
 #
 # Notes:
-# - Session autosave (in-memory) still works as before.
-# - Disk autosave is optional; overhead is tiny for 25-row batches.
-# - Autosave file is NOT auto-cleared; you can clear it after Apply or when you’re done.
+# - Keep SERPAPI_KEY in Streamlit secrets or env
+# - We cache the account call for 60s to avoid extra HTTP
+#
+# Other features retained:
+# - Persistent results UI
+# - Session & persisted skip list
+# - Start-at-row-N
+# - Disk-persisted autosave + recovery
+# - Google CSE daily cap tracker
+#
+# If you prefer the limiter to exclusively use LIVE counts, turn on "Respect SerpAPI monthly limit"—
+# we’ll prefer live plan_searches_left and only fall back to the local JSON when the API fails.
 
 import os, re, time, json, html, requests, io
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -36,7 +41,7 @@ OBFUSCATED_REGEXES = [
 GENERIC_LOCALPART = {"info","contact","office","frontdesk","help","support","admin","billing","media","press","jobs","hr","recruit","webmaster","noreply","no-reply","donotreply","do-not-reply"}
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 USAGE_PATH = Path(".email_enrich_usage.json")              # CSE daily
-SERP_USAGE_PATH = Path(".serpapi_usage.json")              # SerpAPI monthly
+SERP_USAGE_PATH = Path(".serpapi_usage.json")              # SerpAPI monthly (fallback only when Account API not used)
 SKIPLIST_PATH = Path(".email_enrich_skiplist.json")        # persisted skip keys
 AUTOSAVE_PATH = Path(".email_enrich_autosave.json")        # persisted partials
 AUTOSAVE_TMP = Path(".email_enrich_autosave.json.tmp")
@@ -51,7 +56,7 @@ def _month_key():
     return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m")
 
 def _load_usage():
-    # Google CSE daily usage
+    # Google CSE daily usage (local)
     today = _today_et_str()
     usage = {"date": today, "count": 0}
     try:
@@ -97,106 +102,22 @@ def _get_free_cap():
 def _row_key3(first, last, practice):
     return (str(first).strip().lower(), str(last).strip().lower(), str(practice or "").strip().lower())
 
-# --- persisted skip list helpers ---
-def _load_persisted_skiplist():
+# --- SerpAPI Account API (live usage) ---
+@st.cache_data(ttl=60, show_spinner=False)
+def _serpapi_account_info(api_key: str) -> Optional[dict]:
+    if not api_key:
+        return None
+    url = "https://serpapi.com/account.json"
     try:
-        if SKIPLIST_PATH.exists():
-            data = json.loads(SKIPLIST_PATH.read_text())
-            if isinstance(data, list):
-                return [tuple(x) for x in data]
-    except Exception:
-        pass
-    return []
-
-def _save_persisted_skiplist(keys):
-    try:
-        data = [list(t) for t in keys]
-        SKIPLIST_PATH.write_text(json.dumps(data))
-    except Exception:
-        pass
-
-# --- autosave persistence helpers ---
-def _persist_autosave(results: list):
-    try:
-        AUTOSAVE_TMP.write_text(json.dumps(results))
-        AUTOSAVE_TMP.replace(AUTOSAVE_PATH)
-    except Exception:
-        pass
-
-def _load_autosave():
-    try:
-        if AUTOSAVE_PATH.exists():
-            data = json.loads(AUTOSAVE_PATH.read_text())
-            if isinstance(data, list):
-                return data
-    except Exception:
-        pass
-    return []
-
-def _clear_autosave():
-    try:
-        if AUTOSAVE_PATH.exists():
-            AUTOSAVE_PATH.unlink()
-        if AUTOSAVE_TMP.exists():
-            AUTOSAVE_TMP.unlink()
-        return True
-    except Exception:
-        return False
-
-# --- Search backends ---
-def _search_google_cse(query: str, num: int = 5):
-    api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    cse_id  = st.secrets.get("GOOGLE_CSE_ID") or os.getenv("GOOGLE_CSE_ID")
-    if not (api_key and cse_id):
-        return []
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {"key": api_key, "cx": cse_id, "q": query, "num": min(num, 10)}
-    try:
-        r = requests.get(url, params=params, timeout=12)
+        r = requests.get(url, params={"api_key": api_key}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        out = []
-        for item in data.get("items", [])[:num]:
-            link = item.get("link") or ""
-            title = item.get("title") or ""
-            if link:
-                out.append({"title": title, "url": link})
-        return out
+        # Expected keys: searches_per_month, plan_searches_left, this_month_usage, last_hour_searches, account_rate_limit_per_hour, total_searches_left, extra_credits
+        return data
     except Exception:
-        return []
+        return None
 
-def _search_serpapi(query: str, num: int = 5):
-    key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
-    if not key:
-        return []
-    url = "https://serpapi.com/search.json"
-    params = {"engine": "google", "q": query, "num": num, "api_key": key}
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        out = []
-        for item in (data.get("organic_results") or [])[:num]:
-            link = item.get("link") or ""
-            title = item.get("title") or ""
-            if link:
-                out.append({"title": title, "url": link})
-        return out
-    except Exception:
-        return []
-
-def _search_web(provider: str, query: str, num: int = 5):
-    if provider == "SerpAPI":
-        return _search_serpapi(query, num=num) or []
-    if provider == "Google CSE":
-        return _search_google_cse(query, num=num) or []
-    # Auto: prefer SerpAPI if available, else CSE
-    hits = _search_serpapi(query, num=num)
-    if hits:
-        return hits
-    return _search_google_cse(query, num=num)
-
-# --- Fetch / crawl (resource-safe) ---
+# --- Fetch / crawl helpers ---
 def _fetch_html(url: str, timeout=10, max_bytes=750_000) -> str:
     try:
         with requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, stream=True) as r:
@@ -264,18 +185,6 @@ def _collect_internal_links(base_url: str, html_text: str, per_page_limit=6, glo
     return out
 
 # --- Extraction / scoring ---
-def _extract_emails_from_html(html_text: str):
-    emails = set(EMAIL_REGEX.findall(html_text))
-    for rx in OBFUSCATED_REGEXES:
-        for match in rx.findall(html_text):
-            if len(match) == 3:
-                local, domain, tld = match
-                emails.add(f"{local}@{domain}.{tld}")
-            elif len(match) == 2:
-                local, domain = match
-                emails.add(f"{local}@{domain}")
-    return list(emails)
-
 def _domain(url: str) -> str:
     ext = EXTRACTOR(url)
     domain = ".".join(part for part in [ext.domain, ext.suffix] if part)
@@ -319,6 +228,9 @@ def _best_guess_practice_domain(candidates):
             continue
     return ""
 
+EMAIL_RX = EMAIL_REGEX
+OBF_RXS = OBFUSCATED_REGEXES
+
 def _build_query(row: dict) -> str:
     first = str(row.get("First name","")).strip()
     last  = str(row.get("Last name","")).strip()
@@ -333,6 +245,59 @@ def _viable_page(url: str) -> bool:
     bad = ["privacy","terms","login","careers","jobs","press","media","marketing","search?","sso","account"]
     path = urlparse(url).path.lower()
     return not any(b in path for b in bad)
+
+# --- Search backends ---
+def _search_google_cse(query: str, num: int = 5):
+    api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    cse_id  = st.secrets.get("GOOGLE_CSE_ID") or os.getenv("GOOGLE_CSE_ID")
+    if not (api_key and cse_id):
+        return []
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": api_key, "cx": cse_id, "q": query, "num": min(num, 10)}
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in data.get("items", [])[:num]:
+            link = item.get("link") or ""
+            title = item.get("title") or ""
+            if link:
+                out.append({"title": title, "url": link})
+        return out
+    except Exception:
+        return []
+
+def _search_serpapi(query: str, num: int = 5):
+    key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
+    if not key:
+        return []
+    url = "https://serpapi.com/search.json"
+    params = {"engine": "google", "q": query, "num": num, "api_key": key}
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in (data.get("organic_results") or [])[:num]:
+            link = item.get("link") or ""
+            title = item.get("title") or ""
+            if link:
+                out.append({"title": title, "url": link})
+        return out
+    except Exception:
+        return []
+
+def _search_web(provider: str, query: str, num: int = 5):
+    if provider == "SerpAPI":
+        return _search_serpapi(query, num=num) or []
+    if provider == "Google CSE":
+        return _search_google_cse(query, num=num) or []
+    # Auto: prefer SerpAPI if available, else CSE
+    hits = _search_serpapi(query, num=num)
+    if hits:
+        return hits
+    return _search_google_cse(query, num=num)
 
 # --- Core enrichment for a single row ---
 def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None,
@@ -413,11 +378,11 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     if deadline_ts and time.time() > deadline_ts:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before parsing)"}
 
-    # --- Bounded parsing with heartbeat ---
+    # Parsing
     log("Parsing pages for emails...", 0.30)
     emails_found = []
     parsed = 0
-    max_parse = min(len(fetched), 60)  # safety cap
+    max_parse = min(len(fetched), 60)
     for url, html_text in fetched[:max_parse]:
         if deadline_ts and time.time() > deadline_ts:
             return {"Found Email":"", "Email Type":"", "Confidence":0,
@@ -425,10 +390,10 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
         if not html_text:
             continue
         try:
-            txt = html.unescape(html_text[:300_000])  # cap text size
-            for email in set(EMAIL_REGEX.findall(txt)):
+            txt = html.unescape(html_text[:300_000])
+            for email in set(EMAIL_RX.findall(txt)):
                 emails_found.append((email, url))
-            for rx in OBFUSCATED_REGEXES:
+            for rx in OBF_RXS:
                 for match in rx.findall(txt):
                     if len(match) == 3:
                         local, domain, tld = match
@@ -464,7 +429,6 @@ def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
         if not results:
             return 0, "No enrichment results found in session."
         applied = 0
-        # Ensure blacklist exists
         st.session_state.setdefault("_email_enrich_blacklist", [])
         blacklist = st.session_state["_email_enrich_blacklist"]
 
@@ -476,7 +440,6 @@ def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
             pn = rec.get("Practice Name","")
             key = list(_row_key3(fn, ln, pn))
 
-            # Apply if approved + suggested present
             if approved and suggested:
                 mask = (
                     (df["First name"].astype(str).str.strip() == str(fn).strip()) &
@@ -492,13 +455,11 @@ def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
                     df.loc[blanks, "Email"] = suggested
                     applied += int(blanks.sum())
             else:
-                # Not approved OR no suggestion -> add to session blacklist
                 if key not in blacklist:
                     blacklist.append(key)
 
         st.session_state["_email_enrich_blacklist"] = blacklist
 
-        # Persist skip list if requested
         if persist_skip:
             existing = set(_load_persisted_skiplist())
             merged = existing.union(set(tuple(x) for x in blacklist))
@@ -508,51 +469,51 @@ def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
 
-# --- Persistent results renderer (always show editor + downloads + apply if present) ---
-def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False):
+# --- Skip list persistence ---
+def _load_persisted_skiplist():
     try:
-        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
-        if not results:
-            return
-        st.subheader("Email Enrichment Results")
-        edited = st.data_editor(
-            results,
-            width='stretch',
-            num_rows="fixed",
-            key="email_enrich_editor_persistent"
-        )
-        # Keep edited copy in session
-        st.session_state["_email_enrich_results"] = edited
+        if SKIPLIST_PATH.exists():
+            data = json.loads(SKIPLIST_PATH.read_text())
+            if isinstance(data, list):
+                return [tuple(x) for x in data]
+    except Exception:
+        pass
+    return []
 
-        df_out = pd.DataFrame(edited)
+def _save_persisted_skiplist(keys):
+    try:
+        data = [list(t) for t in keys]
+        SKIPLIST_PATH.write_text(json.dumps(data))
+    except Exception:
+        pass
 
-        st.download_button(
-            "Download enrichment results (CSV)",
-            df_out.to_csv(index=False).encode("utf-8"),
-            file_name="email_enrichment_results.csv",
-            mime="text/csv",
-            key="dl_results_csv_persist",
-        )
+# --- Autosave persistence helpers ---
+def _persist_autosave(results: list):
+    try:
+        AUTOSAVE_TMP.write_text(json.dumps(results))
+        AUTOSAVE_TMP.replace(AUTOSAVE_PATH)
+    except Exception:
+        pass
 
-        # Optional XLSX
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-            df_out.to_excel(xw, index=False, sheet_name="Results")
-        st.download_button(
-            "Download enrichment results (Excel)",
-            data=buf.getvalue(),
-            file_name="email_enrichment_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_results_xlsx_persist",
-        )
+def _load_autosave():
+    try:
+        if AUTOSAVE_PATH.exists():
+            data = json.loads(AUTOSAVE_PATH.read_text())
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
 
-        # Apply button (persistent)
-        if df is not None:
-            if st.button("Apply approved emails to Data", key="apply_btn_persist"):
-                applied, msg = apply_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
-                st.success(f"{msg} Updated rows: {applied}")
-    except Exception as e:
-        st.warning(f"Could not render results: {e}")
+def _clear_autosave():
+    try:
+        if AUTOSAVE_PATH.exists():
+            AUTOSAVE_PATH.unlink()
+        if AUTOSAVE_TMP.exists():
+            AUTOSAVE_TMP.unlink()
+        return True
+    except Exception:
+        return False
 
 # --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
@@ -570,7 +531,7 @@ def email_enrichment_sidebar(df):
         return
 
     provider = st.selectbox("Search provider", ["Auto"] + available, index=0,
-                            help="Auto = prefers SerpAPI (if present), else Google CSE.")
+                            help="Auto = prefers SerpAPI if present, else Google CSE.")
     mode = st.radio("Mode", ["Balanced","Thorough","Fast"], index=0)
 
     # Controls / status
@@ -588,26 +549,41 @@ def email_enrichment_sidebar(df):
     max_internal_pages = st.slider("Max internal pages", 0, 120, 24, step=6,
                                    help="Upper bound when exploring internal links. Set 0 to disable.")
 
-    # Determine which cap to display
+    # Determine which caps to display
     using_serp_pref = (provider == "SerpAPI") or (provider == "Auto" and bool(serp_key))
     using_cse = (provider == "Google CSE") or (provider == "Auto" and not bool(serp_key) and (g_api and g_cx))
 
     enforce_free = False
     respect_serp_cap = False
 
+    # Google CSE
     if using_cse:
         st.info("Using Google CSE • Free tier ~100 queries/day. Capped by default.")
         enforce_free = st.toggle("Never exceed free tier (100/day)", value=True, key="cse_cap_toggle")
         usage = _load_usage(); cap = _get_free_cap()
         remaining = max(0, cap - int(usage.get("count", 0)))
-        st.write(f"**Remaining today (ET): {remaining} / {cap}**")
+        st.write(f"**CSE Remaining today (ET): {remaining} / {cap}**")
 
+    # SerpAPI (live)
+    live_remaining_mo = None
+    live_monthly_cap = None
     if using_serp_pref:
-        st.info("Using SerpAPI • Free tier ~250 queries/month.")
-        respect_serp_cap = st.toggle("Respect SerpAPI free tier (250/month)", value=True, key="serp_cap_toggle")
-        su = _load_serp_month_usage()
-        remaining_mo = max(0, 250 - int(su.get("count", 0)))
-        st.write(f"**Remaining this month (ET): {remaining_mo} / 250**")
+        st.info("Using SerpAPI • Free plan ~250 searches/month (varies by plan).")
+        respect_serp_cap = st.toggle("Respect SerpAPI monthly limit", value=True, key="serp_cap_toggle")
+        acct = _serpapi_account_info(serp_key) if serp_key else None
+        if acct:
+            live_monthly_cap = acct.get("searches_per_month")
+            live_remaining_mo = acct.get("plan_searches_left", acct.get("total_searches_left"))
+            used = acct.get("this_month_usage")
+            last_hr = acct.get("last_hour_searches")
+            hr_cap = acct.get("account_rate_limit_per_hour")
+            st.write(f"**SerpAPI (live): used {used} / {live_monthly_cap}, remaining {live_remaining_mo}**")
+            if last_hr is not None and hr_cap is not None:
+                st.caption(f"Last hour: {last_hr} • Hourly cap: {hr_cap}")
+        else:
+            su = _load_serp_month_usage()
+            remaining_mo = max(0, 250 - int(su.get("count", 0)))
+            st.write(f"**SerpAPI (local est.): remaining {remaining_mo} / 250**")
 
     needed = ["First name","Last name","Practice Name","City","State","Email"]
     missing = [c for c in needed if c not in df.columns]
@@ -671,12 +647,13 @@ def email_enrichment_sidebar(df):
 
     overwrite = st.checkbox("Overwrite existing Email values", value=False)
 
+    # Candidate filtering
     if overwrite:
         candidates_df = df.copy()
     else:
         candidates_df = df[df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")]
 
-    # Skip list (session and optionally persisted)
+    # Skip list (session & persisted)
     skip_attempted = st.toggle("Skip already attempted this session", value=True,
                                help="Skips rows you did not approve in prior runs this session (created when you click Apply).")
     if skip_attempted:
@@ -733,6 +710,7 @@ def email_enrichment_sidebar(df):
         except Exception:
             pass
 
+    # --- RUN BUTTON ---
     if st.button("Run email search", key="run_search_btn", disabled=(max_limit == 0)):
         # Effective total based on offset
         avail = max(0, len(candidates_df) - int(start_offset))
@@ -752,6 +730,13 @@ def email_enrichment_sidebar(df):
         # Determine caps once per run
         using_serp_pref = (provider == "SerpAPI") or (provider == "Auto" and bool(serp_key))
         using_cse = (provider == "Google CSE") or (provider == "Auto" and not bool(serp_key) and (g_api and g_cx))
+
+        # Pull LIVE SerpAPI counters once per run (cache 60s)
+        live_plan_remaining = None
+        if using_serp_pref and respect_serp_cap and serp_key:
+            acct = _serpapi_account_info(serp_key)
+            if acct:
+                live_plan_remaining = acct.get("plan_searches_left", acct.get("total_searches_left"))
 
         for i, (_, row) in enumerate(subset.iterrows(), start=1):
             if st.session_state.get("_abort_enrich"):
@@ -774,16 +759,22 @@ def email_enrichment_sidebar(df):
                 usage["count"] = int(usage.get("count", 0)) + 1
                 _save_usage(usage)
 
-            # --- SerpAPI monthly limiter (before querying) ---
+            # --- SerpAPI monthly limiter (prefer LIVE; fallback to local) ---
             if using_serp_pref and respect_serp_cap:
-                su = _load_serp_month_usage()
-                if su.get("month") != _month_key():
-                    su = {"month": _month_key(), "count": 0}
-                if int(su.get("count", 0)) >= 250:
-                    st.warning("Monthly free SerpAPI quota reached — stopping.")
-                    break
-                su["count"] = int(su.get("count", 0)) + 1
-                _save_serp_month_usage(su)
+                if live_plan_remaining is not None:
+                    if live_plan_remaining <= 0:
+                        st.warning("SerpAPI monthly limit reached (live) — stopping.")
+                        break
+                    live_plan_remaining -= 1
+                else:
+                    su = _load_serp_month_usage()
+                    if su.get("month") != _month_key():
+                        su = {"month": _month_key(), "count": 0}
+                    if int(su.get("count", 0)) >= 250:
+                        st.warning("SerpAPI monthly limit reached (local est.) — stopping.")
+                        break
+                    su["count"] = int(su.get("count", 0)) + 1
+                    _save_serp_month_usage(su)
 
             def logger(msg, frac=None):
                 row_status.write(msg)
@@ -824,7 +815,6 @@ def email_enrichment_sidebar(df):
 
         if not results:
             st.info("No results.")
-            # Even if empty, try to render any previous results
             render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
             return
 
@@ -846,4 +836,47 @@ def email_enrichment_sidebar(df):
 
     # Always show results area if any exist
     render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
+
+# --- Persistent results renderer ---
+def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False):
+    try:
+        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
+        if not results:
+            return
+        st.subheader("Email Enrichment Results")
+        edited = st.data_editor(
+            results,
+            width='stretch',
+            num_rows="fixed",
+            key="email_enrich_editor_persistent"
+        )
+        st.session_state["_email_enrich_results"] = edited
+
+        df_out = pd.DataFrame(edited)
+
+        st.download_button(
+            "Download enrichment results (CSV)",
+            df_out.to_csv(index=False).encode("utf-8"),
+            file_name="email_enrichment_results.csv",
+            mime="text/csv",
+            key="dl_results_csv_persist",
+        )
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            df_out.to_excel(xw, index=False, sheet_name="Results")
+        st.download_button(
+            "Download enrichment results (Excel)",
+            data=buf.getvalue(),
+            file_name="email_enrichment_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_results_xlsx_persist",
+        )
+
+        if df is not None:
+            if st.button("Apply approved emails to Data", key="apply_btn_persist"):
+                applied, msg = apply_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
+                st.success(f"{msg} Updated rows: {applied}")
+    except Exception as e:
+        st.warning(f"Could not render results: {e}")
 
