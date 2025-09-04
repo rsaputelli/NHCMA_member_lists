@@ -1,9 +1,7 @@
-# Patch the utility to reduce per-row load, add row time budget & heartbeat, and lower concurrency to avoid Cloud restarts.
-from pathlib import Path
-util_path = Path("/mnt/data/email_enrichment_util.py")
 
-patched = r'''
-# email_enrichment_util.py (stability-safe)
+# email_enrichment_util.py — CLEAN, import-safe
+# Adds: Balanced/Thorough/Fast modes, row time budget, heartbeat, Stop button,
+# capped fetches, lower concurrency, obfuscated email detection, width='...' API.
 import os, re, time, json, html, requests
 from typing import List, Dict, Tuple
 from pathlib import Path
@@ -111,7 +109,6 @@ def _fetch_html(url: str, timeout=10, max_bytes=750_000) -> str:
     try:
         with requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, stream=True) as r:
             r.raise_for_status()
-            # try to read up to max_bytes to avoid OOM on large pages
             content = b""
             for chunk in r.iter_content(chunk_size=32_768):
                 content += chunk
@@ -125,7 +122,6 @@ def _fetch_html(url: str, timeout=10, max_bytes=750_000) -> str:
         return ""
 
 def _fetch_html_parallel(urls, timeout=10, max_workers=4, cap_total=None, logger=None):
-    # Respect a cap on total pages fetched this round
     urls = urls[:cap_total] if cap_total else urls
     results = []
     if not urls:
@@ -167,7 +163,6 @@ def _collect_internal_links(base_url: str, html_text: str, per_page_limit=6, glo
                 links.append(full)
         if len(links) >= per_page_limit:
             break
-    # de-dup while preserving order
     seen = set()
     out = []
     for u in links:
@@ -247,14 +242,13 @@ def _viable_page(url: str) -> bool:
     return not any(b in path for b in bad)
 
 def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None) -> Dict:
-    # Mode caps tuned for Cloud stability
     if mode == "Thorough":
         search_num = 10; initial_cap = 40; internal_per_page = 8; internal_total_cap = 120
         max_workers = 6; timeout = 12
     elif mode == "Fast":
         search_num = 3; initial_cap = 10; internal_per_page = 0; internal_total_cap = 0
         max_workers = 6; timeout = 6
-    else:  # Balanced
+    else:
         search_num = 6; initial_cap = 24; internal_per_page = 6; internal_total_cap = 36
         max_workers = 4; timeout = 10
 
@@ -285,7 +279,6 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
             u = base + s
             if _viable_page(u):
                 candidates.append(u)
-    # Global cap for initial pages
     candidates = list(dict.fromkeys(candidates))[:initial_cap]
 
     if deadline_ts and time.time() > deadline_ts:
@@ -294,7 +287,6 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     log(f"Fetching up to {len(candidates)} pages...", 0.05)
     fetched = _fetch_html_parallel(candidates, timeout=timeout, max_workers=max_workers, cap_total=len(candidates), logger=logger)
 
-    # Crawl internal links only if budget allows
     if internal_per_page > 0 and internal_total_cap > 0 and (not deadline_ts or time.time() < deadline_ts):
         seen = set()
         more = []
@@ -327,7 +319,6 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
         txt = html.unescape(html_text)
         for email in set(EMAIL_REGEX.findall(txt)):
             emails_found.append((email, url))
-        # obfuscated forms
         for rx in OBFUSCATED_REGEXES:
             for match in rx.findall(txt):
                 if len(match) == 3:
@@ -370,7 +361,6 @@ def email_enrichment_sidebar(df):
                             help="Auto = prefers SerpAPI (if present), else Google CSE.")
     mode = st.radio("Mode", ["Balanced","Thorough","Fast"], index=0)
 
-    # Heartbeat / stop / row time budget
     status = st.empty()
     row_status = st.empty()
     row_bar = st.progress(0.0)
@@ -478,7 +468,6 @@ def email_enrichment_sidebar(df):
 
         st.write("Tip: uncheck **Approve** for generic inboxes you don’t want to use.")
 
-        # Offer CSV download of the review grid
         try:
             import pandas as pd
             delta = pd.DataFrame(edited)
@@ -545,17 +534,5 @@ def apply_email_enrichment_results(df, overwrite=False):
         return applied, "Applied enrichment results from session."
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
-'''
-util_path.write_text(patched, encoding="utf-8")
 
-# Also ensure the standalone page uses width= API consistently.
-page_path = Path("/mnt/data/pages/02_Email_Search_Utility.py")
-if page_path.exists():
-    pg = page_path.read_text(encoding="utf-8", errors="ignore")
-    pg = pg.replace("use_container_width=True", "width='stretch'")
-    pg = pg.replace("use_container_width=False", "width='content'")
-    # Ensure imports still valid
-    page_path.write_text(pg, encoding="utf-8")
-
-print("Patched utility for stability and updated page widths.")
 
