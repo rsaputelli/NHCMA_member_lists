@@ -517,7 +517,7 @@ def _clear_autosave():
 
 # --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
-    st.session_state.setdefault(\"_results_rendered\", False)
+    st.session_state.setdefault("_results_rendered", False)
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
 
     serp_key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
@@ -713,12 +713,12 @@ def email_enrichment_sidebar(df):
                     st.info(f"Saved to disk: {base}.csv and {base}.xlsx")
             except Exception as e:
                 st.warning(f"Could not prepare full dataset downloads: {e}")
-try:
+        try:
             res = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
             if res:
                 df_out = pd.DataFrame(res)
                 st.download_button(
-                    "Download Enriched CSV (from sidebar)",
+                    "Download Enrichment Results (CSV)",
                     df_out.to_csv(index=False).encode("utf-8"),
                     file_name="email_enrichment_results.csv",
                     mime="text/csv",
@@ -728,13 +728,14 @@ try:
                 with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
                     df_out.to_excel(xw, index=False, sheet_name="Results")
                 st.download_button(
-                    "Download Enriched Excel (from sidebar)",
+                    "Download Enrichment Results (Excel)",
                     data=buf.getvalue(),
                     file_name="email_enrichment_results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_sidebar_xlsx",
                 )
         except Exception:
+            pass
             pass
 
     # --- RUN BUTTON ---
@@ -844,7 +845,7 @@ try:
         if not results:
             st.info("No results.")
             render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
-        st.session_state["_results_rendered"] = True
+            st.session_state["_results_rendered"] = True
             return
 
         st.session_state["_enrich_partial"] = results.copy()
@@ -965,6 +966,7 @@ def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False
                     )
                 except Exception as e:
                     st.warning(f"Could not prepare full dataset downloads: {e}")
-except Exception as e:
+    except Exception as e:
         st.warning(f"Could not render results: {e}")
+
 
