@@ -291,3 +291,23 @@ if st.session_state.results:
         )
 else:
     st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download Cleaned_Members_for_GlueUp.xlsx",
+            data=st.session_state.results["cleaned_bytes"],
+            file_name="Cleaned_Members_for_GlueUp.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_cleaned"
+        )
+    with d2:
+        st.download_button(
+            "Download Members_Missing_Emails.xlsx",
+            data=st.session_state.results["missing_bytes"],
+            file_name="Members_Missing_Emails.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_missing"
+        )
+else:
+    st.info("Upload both files to begin. Then choose the correct sheet(s) in the sidebar.")
