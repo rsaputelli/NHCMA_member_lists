@@ -1,89 +1,147 @@
+# Utilities • Email Search (Standalone)
+# - Persists uploaded dataset across reruns in st.session_state["_master_df"]
+# - Runs email_enrichment_sidebar(df) on the SAME DataFrame instance
+# - After sidebar "Apply approved", changes persist (we save df back to session)
+# - Optional: buttons to load last saved enriched CSV/XLSX written by the util's
+#             "Persist full dataset to disk on Apply" toggle
 
-import os, io, pandas as pd, streamlit as st
-from email_enrichment_util import email_enrichment_sidebar, apply_email_enrichment_results
-
+import streamlit as st
 st.set_page_config(page_title="Utilities • Email Search (Standalone)", layout="wide")
 
+import os
+import io
+import pandas as pd
+from io import BytesIO
+from email_enrichment_util import email_enrichment_sidebar  # apply handled inside the util
+
 st.title("Utilities: Email Search (Standalone)")
-st.caption("Upload any CSV/XLSX, enrich emails from public sources, and download the enriched file — no need to run the main cleaner.")
+st.caption("Upload any CSV/XLSX, map columns, run the email search in the sidebar, approve, apply, and download the enriched file.")
 
-uploaded = st.file_uploader("Upload list to enrich (Excel .xlsx or CSV .csv)", type=["xlsx","csv"])
-df = None
-if uploaded is not None:
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
-        else:
-            sheet = 0
-            try:
-                xls = pd.ExcelFile(uploaded)
-                sheet = st.selectbox("Choose sheet", xls.sheet_names, index=0)
-                skip = st.number_input("Rows to skip before header", min_value=0, max_value=200, value=0, step=1)
-                df = pd.read_excel(uploaded, sheet_name=sheet, skiprows=int(skip))
-            except Exception as e:
-                st.error(f"Excel read error: {e}")
-                df = None
-    except Exception as e:
-        st.error(f"File read error: {e}")
-        df = None
+# ---------------------------
+# Upload + session persistence
+# ---------------------------
 
-if df is not None and not df.empty:
-    st.subheader("Preview")
-    st.dataframe(df.head(200), use_container_width=True)
+def _load_df_from_upload(uploaded):
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(BytesIO(data))
+    return pd.read_csv(BytesIO(data))
 
-    st.subheader("Map required columns")
-    opts = [None] + list(df.columns)
+uploaded = st.file_uploader("Upload list to enrich (Excel .xlsx or CSV .csv)", type=["xlsx", "csv"])
+if uploaded and st.session_state.get("_uploaded_token") != uploaded.name:
+    st.session_state["_uploaded_token"] = uploaded.name
+    st.session_state["_uploaded_bytes"] = uploaded.getvalue()
+    st.session_state["_master_df"] = _load_df_from_upload(uploaded)
 
-    def pick_guess(parts):
-        for c in df.columns:
-            s = str(c).lower().replace("_"," ").strip()
-            if any(p in s for p in parts):
-                return c
-        return None
-
-    first_col  = st.selectbox("First name", options=opts, index=(opts.index(pick_guess(['first'])) if pick_guess(['first']) in opts else 0))
-    last_col   = st.selectbox("Last name",  options=opts, index=(opts.index(pick_guess(['last'])) if pick_guess(['last']) in opts else 0))
-    prac_col   = st.selectbox("Practice Name", options=opts, index=(opts.index(pick_guess(['practice','group','clinic','hospital'])) if pick_guess(['practice','group','clinic','hospital']) in opts else 0))
-    city_col   = st.selectbox("City", options=opts, index=(opts.index(pick_guess(['city'])) if pick_guess(['city']) in opts else 0))
-    state_col  = st.selectbox("State", options=opts, index=(opts.index(pick_guess(['state','province'])) if pick_guess(['state','province']) in opts else 0))
-    email_col  = st.selectbox("Email (if exists)", options=opts, index=(opts.index(pick_guess(['email','e-mail'])) if pick_guess(['email','e-mail']) in opts else 0))
-
-    work = df.copy()
-    alias = {}
-    if first_col: alias[first_col] = "First name"
-    if last_col:  alias[last_col]  = "Last name"
-    if prac_col:  alias[prac_col]  = "Practice Name"
-    if city_col:  alias[city_col]  = "City"
-    if state_col: alias[state_col] = "State"
-    if email_col: alias[email_col] = "Email"
-    if alias:
-        work.rename(columns=alias, inplace=True)
-    if "Email" not in work.columns:
-        work["Email"] = ""
-
-    # Sidebar enrichment tool
-    with st.sidebar.expander("🔎 Email Enrichment (beta)", expanded=False):
-        email_enrichment_sidebar(work)
-
-    st.info("After running the search in the sidebar and approving rows, click Apply to write results into your data.")
-
-    if st.button("✅ Apply approved (from sidebar)", use_container_width=False):
-        applied, msg = apply_email_enrichment_results(work, overwrite=False)
-        if applied:
-            st.success(f"Applied {applied} emails to the dataset.")
-        else:
-            st.warning(msg)
-
-    st.subheader("Download")
-    c1, c2 = st.columns([1,1])
-    with c1:
-        csv_bytes = work.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Enriched CSV", data=csv_bytes, file_name="enriched_members.csv", mime="text/csv")
-    with c2:
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            work.to_excel(writer, index=False, sheet_name="Enriched")
-        st.download_button("Download Enriched Excel", data=bio.getvalue(), file_name="enriched_members.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
+if "_master_df" not in st.session_state or st.session_state["_master_df"] is None:
     st.info("Upload a CSV/XLSX to get started.")
+    st.stop()
+
+df = st.session_state["_master_df"]
+
+# --------
+# Preview
+# --------
+st.subheader("Preview")
+st.dataframe(df.head(200), use_container_width=True)
+
+# ---------------------
+# Column mapping (light)
+# ---------------------
+opts = [None] + list(df.columns)
+
+def _pick_guess(parts):
+    for c in df.columns:
+        s = str(c).lower().replace("_", " ").strip()
+        if any(p in s for p in parts):
+            return c
+    return None
+
+first_col  = st.selectbox("First name",       options=opts, index=(opts.index(_pick_guess(['first'])) if _pick_guess(['first']) in opts else 0))
+last_col   = st.selectbox("Last name",        options=opts, index=(opts.index(_pick_guess(['last'])) if _pick_guess(['last']) in opts else 0))
+prac_col   = st.selectbox("Practice Name",    options=opts, index=(opts.index(_pick_guess(['practice','group','clinic','hospital'])) if _pick_guess(['practice','group','clinic','hospital']) in opts else 0))
+city_col   = st.selectbox("City",             options=opts, index=(opts.index(_pick_guess(['city'])) if _pick_guess(['city']) in opts else 0))
+state_col  = st.selectbox("State",            options=opts, index=(opts.index(_pick_guess(['state','province'])) if _pick_guess(['state','province']) in opts else 0))
+email_col  = st.selectbox("Email (if exists)",options=opts, index=(opts.index(_pick_guess(['email','e-mail'])) if _pick_guess(['email','e-mail']) in opts else 0))
+
+# Work on the SAME DataFrame instance
+work = df
+
+# Normalize headers expected by the enrichment util
+alias = {}
+if first_col: alias[first_col] = "First name"
+if last_col:  alias[last_col]  = "Last name"
+if prac_col:  alias[prac_col]  = "Practice Name"
+if city_col:  alias[city_col]  = "City"
+if state_col: alias[state_col] = "State"
+if email_col: alias[email_col] = "Email"
+if alias:
+    work.rename(columns=alias, inplace=True)
+if "Email" not in work.columns:
+    work["Email"] = ""
+
+st.divider()
+
+# ----------------------------
+# Sidebar: Email enrichment UI
+# ----------------------------
+with st.sidebar.expander("🔎 Email Enrichment", expanded=True):
+    email_enrichment_sidebar(work)
+st.info("After running the search in the sidebar and approving rows, click **Apply** in the results area (or sidebar).")
+
+# Persist any in-place edits made by the util’s “Apply approved”
+st.session_state["_master_df"] = work
+
+# ------------------------------------------------------------
+# Optional: reload last saved enriched dataset written on Apply
+# (only useful if you turned on “Persist full dataset to disk on Apply”)
+# ------------------------------------------------------------
+base = st.session_state.get("_persist_dataset_name", "enriched_dataset")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("Load last saved enriched CSV"):
+        path = f"{base}.csv"
+        if os.path.exists(path):
+            st.session_state["_master_df"] = pd.read_csv(path)
+            st.success(f"Loaded {path}")
+        else:
+            st.warning(f"{path} not found.")
+with c2:
+    if st.button("Load last saved enriched Excel"):
+        path = f"{base}.xlsx"
+        if os.path.exists(path):
+            st.session_state["_master_df"] = pd.read_excel(path)
+            st.success(f"Loaded {path}")
+        else:
+            st.warning(f"{path} not found.")
+
+st.divider()
+
+# -------------------
+# Manual downloads too
+# -------------------
+st.subheader("Download (current in-memory dataset)")
+c1, c2 = st.columns(2)
+with c1:
+    csv_bytes = work.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Enriched CSV",
+        data=csv_bytes,
+        file_name="enriched_members.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with c2:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        work.to_excel(writer, index=False, sheet_name="Enriched")
+    st.download_button(
+        "Download Enriched Excel",
+        data=bio.getvalue(),
+        file_name="enriched_members.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
 
