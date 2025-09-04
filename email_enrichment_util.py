@@ -1,7 +1,5 @@
 
-# email_enrichment_util.py — CLEAN, import-safe
-# Adds: Balanced/Thorough/Fast modes, row time budget, heartbeat, Stop button,
-# capped fetches, lower concurrency, obfuscated email detection, width='...' API.
+# email_enrichment_util.py — CLEAN, import-safe, with internal-link toggle
 import os, re, time, json, html, requests
 from typing import List, Dict, Tuple
 from pathlib import Path
@@ -241,16 +239,21 @@ def _viable_page(url: str) -> bool:
     path = urlparse(url).path.lower()
     return not any(b in path for b in bad)
 
-def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None) -> Dict:
+def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None,
+                   explore_internal: bool = False, max_internal_pages: int = 24) -> Dict:
     if mode == "Thorough":
-        search_num = 10; initial_cap = 40; internal_per_page = 8; internal_total_cap = 120
+        search_num = 10; initial_cap = 24; internal_per_page = 8; internal_total_cap = min(120, max_internal_pages)
         max_workers = 6; timeout = 12
     elif mode == "Fast":
         search_num = 3; initial_cap = 10; internal_per_page = 0; internal_total_cap = 0
         max_workers = 6; timeout = 6
     else:
-        search_num = 6; initial_cap = 24; internal_per_page = 6; internal_total_cap = 36
+        search_num = 6; initial_cap = 18; internal_per_page = 6; internal_total_cap = min(36, max_internal_pages)
         max_workers = 4; timeout = 10
+
+    if not explore_internal:
+        internal_per_page = 0
+        internal_total_cap = 0
 
     def log(msg, frac=None):
         if logger:
@@ -364,13 +367,16 @@ def email_enrichment_sidebar(df):
     status = st.empty()
     row_status = st.empty()
     row_bar = st.progress(0.0)
-    c1, c2 = st.columns([1,2])
+    c1, c2 = st.columns([2,2])
     with c1:
         if st.button("⏹️ Stop run", key="stop_run_btn", width='content'):
             st.session_state["_abort_enrich"] = True
     st.session_state.setdefault("_abort_enrich", False)
     row_time_budget = st.number_input("Per-row time budget (sec)", min_value=60, max_value=600, value=180, step=30,
                                       help="Skip to next row if a site is too slow.")
+    explore_internal = st.checkbox("Explore internal links (slower, finds more)", value=False)
+    max_internal_pages = st.slider("Max internal pages", 0, 120, 24, step=6,
+                                   help="Upper bound when exploring internal links. Set 0 to disable.")
 
     using_cse = (provider == "Google CSE") or (provider == "Auto" and not serp_key and (g_api and g_cx))
     if using_cse:
@@ -406,7 +412,6 @@ def email_enrichment_sidebar(df):
 
     limit = st.number_input("Max records to scan", min_value=0, max_value=int(max_limit), value=int(min(default_limit, max_limit)))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
-
     autosave_every = st.number_input("Autosave every N rows", min_value=1, max_value=100, value=10, step=1)
 
     if st.button("Run email search", key="run_search_btn", width='content', disabled=(max_limit == 0)):
@@ -431,7 +436,10 @@ def email_enrichment_sidebar(df):
                 if frac is not None:
                     row_bar.progress(min(max(frac, 0.0), 0.95))
 
-            res = _enrich_single(row.to_dict(), provider, mode=mode, logger=logger, deadline_ts=deadline_ts)
+            res = _enrich_single(
+                row.to_dict(), provider, mode=mode, logger=logger, deadline_ts=deadline_ts,
+                explore_internal=explore_internal, max_internal_pages=int(max_internal_pages)
+            )
             row_bar.progress(1.0)
             row_status.write("Row done.")
 
