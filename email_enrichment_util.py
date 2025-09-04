@@ -33,6 +33,12 @@ import tldextract
 import pandas as pd
 
 # --- Regexes / constants ---
+
+def _ensure_enrichstatus(df):
+    if "EnrichStatus" not in df.columns:
+        df["EnrichStatus"] = ""
+    return df
+
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 OBFUSCATED_REGEXES = [
     re.compile(r"([A-Z0-9._%+-]+)\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*([A-Z0-9.-]+)\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*([A-Z]{2,})", re.I),
@@ -425,6 +431,8 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
 # --- External helper to apply last reviewed results to a df (persist-safe) ---
 def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
     try:
+        if "EnrichStatus" not in df.columns:
+            df["EnrichStatus"] = ""
         results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
         if not results:
             return 0, "No enrichment results found in session."
@@ -450,11 +458,14 @@ def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
                 if overwrite:
                     df.loc[mask, "Email"] = suggested
                     applied += int(mask.sum())
+                    df.loc[mask, "EnrichStatus"] = "approved"
                 else:
                     blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
                     df.loc[blanks, "Email"] = suggested
                     applied += int(blanks.sum())
+                    df.loc[mask, "EnrichStatus"] = "approved"
             else:
+                df.loc[mask, "EnrichStatus"] = "skipped"
                 if key not in blacklist:
                     blacklist.append(key)
 
@@ -517,6 +528,7 @@ def _clear_autosave():
 
 # --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
+    st.session_state.setdefault(\"_results_rendered\", False)
     st.session_state.setdefault("_results_rendered", False)
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
 
@@ -592,6 +604,7 @@ def email_enrichment_sidebar(df):
         st.warning(f"Missing required columns: {', '.join(missing)}")
         return
 
+    _ensure_enrichstatus(df)
     # --- Skip list controls ---
     st.session_state.setdefault("_email_enrich_blacklist", [])
     persist_skip = st.toggle("Persist skip list across restarts", value=False,
@@ -617,6 +630,39 @@ def email_enrichment_sidebar(df):
             st.session_state["_email_enrich_blacklist"] = []
             st.success("Session skip list cleared.")
 
+
+    # --- Cross-session restart safety using EnrichStatus column ---
+    use_status_skip = st.toggle(
+        "Use EnrichStatus to skip processed rows",
+        value=True,
+        help="Skips rows marked 'approved' or 'skipped' from prior runs (survives reboots in the CSV/XLSX)."
+    )
+    include_skipped = st.checkbox(
+        "Include previously 'skipped' rows",
+        value=False,
+        help="If ON, rows with EnrichStatus = 'skipped' become eligible again."
+    )
+
+    with st.expander("EnrichStatus / restart safety", expanded=False):
+        c_a, c_b, c_c = st.columns(3)
+        with c_a:
+            if st.button("Clear EnrichStatus for ALL rows", key="clear_status_all"):
+                _ensure_enrichstatus(df)
+                df["EnrichStatus"] = ""
+                st.success("EnrichStatus cleared for all rows.")
+        with c_b:
+            if st.button("Clear EnrichStatus for BLANK-Email rows", key="clear_status_blank_email"):
+                _ensure_enrichstatus(df)
+                mask_blank = df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")
+                df.loc[mask_blank, "EnrichStatus"] = ""
+                st.success("EnrichStatus cleared for rows with blank Email.")
+        with c_c:
+            if st.button("Re-try previously skipped (set to 'retry')", key="retry_skipped"):
+                _ensure_enrichstatus(df)
+                df.loc[df["EnrichStatus"].astype(str).str.lower().eq("skipped"), "EnrichStatus"] = "retry"
+                st.success("EnrichStatus for previously 'skipped' rows set to 'retry'. Rows with status 'retry' are eligible.")
+        st.caption("Tip: Keep 'Use EnrichStatus…' ON to avoid burning searches after a reboot. Upload your enriched file next session so these markers persist.")
+
     # --- Autosave persistence controls ---
     persist_autosave = st.toggle("Persist autosave to disk", value=False,
                                  help="Writes partial results to disk during a run so you can recover after a restart.")
@@ -636,7 +682,9 @@ def email_enrichment_sidebar(df):
                     if recovered:
                         st.session_state["_enrich_partial"] = recovered
                         st.session_state["_email_enrich_results"] = recovered
+                        st.session_state["_results_rendered"] = False
                         st.success(f"Recovered {len(recovered)} rows from autosave.")
+                        st.rerun()
                     else:
                         st.info("No recoverable autosave found.")
             with recov_cols[1]:
@@ -646,6 +694,37 @@ def email_enrichment_sidebar(df):
                     else:
                         st.warning("Could not clear autosave file.")
 
+    # --- Always-visible recovery tools ---
+    try:
+        _count = 0
+        if AUTOSAVE_PATH.exists():
+            try:
+                _data = json.loads(AUTOSAVE_PATH.read_text())
+                _count = len(_data) if isinstance(_data, list) else 0
+            except Exception:
+                _count = 0
+            colA, colB, colC = st.columns([1,1,1])
+            with colA:
+                if st.button(f"Recover autosave ({_count} rows)", key="recover_autosave_always"):
+                    recovered = _load_autosave()
+                    if recovered:
+                        st.session_state["_enrich_partial"] = recovered
+                        st.session_state["_email_enrich_results"] = recovered
+                        st.session_state["_results_rendered"] = False
+                        st.success(f"Recovered {len(recovered)} rows from autosave.")
+                        st.rerun()
+                    else:
+                        st.info("No recoverable autosave found.")
+            with colB:
+                if st.button("Clear autosave file", key="clear_autosave_always"):
+                    st.success("Autosave file cleared.") if _clear_autosave() else st.warning("Could not clear autosave file.")
+            with colC:
+                if st.button("Show recovered results", key="show_recovered_results"):
+                    st.session_state["_results_rendered"] = False
+                    st.rerun()
+    except Exception:
+        pass
+
     overwrite = st.checkbox("Overwrite existing Email values", value=False)
 
     # Candidate filtering
@@ -654,6 +733,15 @@ def email_enrichment_sidebar(df):
     else:
         candidates_df = df[df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")]
 
+
+    # Apply EnrichStatus-based skipping
+    if "EnrichStatus" in df.columns and use_status_skip:
+        status_series = df["EnrichStatus"].astype(str).str.lower().str.strip()
+        if include_skipped:
+            eligible = ~status_series.eq("approved")
+        else:
+            eligible = status_series.isin(["", "none", "retry"])
+        candidates_df = candidates_df[eligible.loc[candidates_df.index]]
     # Skip list (session & persisted)
     skip_attempted = st.toggle("Skip already attempted this session", value=True,
                                help="Skips rows you did not approve in prior runs this session (created when you click Apply).")
@@ -968,5 +1056,6 @@ def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False
                     st.warning(f"Could not prepare full dataset downloads: {e}")
     except Exception as e:
         st.warning(f"Could not render results: {e}")
+
 
 
