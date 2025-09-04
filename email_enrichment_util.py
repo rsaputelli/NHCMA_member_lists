@@ -1,5 +1,16 @@
 
-# email_enrichment_util.py — CLEAN, import-safe, with internal-link toggle
+# email_enrichment_util.py — FINAL (import-safe)
+# Features:
+# • Modes: Fast / Balanced / Thorough
+# • Heartbeat status + row mini progress bar
+# • ⏹ Stop run button
+# • Per-row time budget (sec)
+# • Optional internal-link exploration (toggle) with cap
+# • Bounded parsing (caps pages & text; yields heartbeat)
+# • tldextract offline extractor (no network)
+# • Google CSE free-tier limiter counted PER ROW before search
+# • Streamlit new width API: width='stretch'|'content'
+
 import os, re, time, json, html, requests
 from typing import List, Dict, Tuple
 from pathlib import Path
@@ -12,14 +23,18 @@ import streamlit as st
 from bs4 import BeautifulSoup
 import tldextract
 
+# --- Regexes / constants ---
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 OBFUSCATED_REGEXES = [
     re.compile(r"([A-Z0-9._%+-]+)\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*([A-Z0-9.-]+)\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*([A-Z]{2,})", re.I),
     re.compile(r"([A-Z0-9._%+-]+)\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*([A-Z0-9.-]+\.[A-Z]{2,})", re.I),
 ]
 GENERIC_LOCALPART = {"info","contact","office","frontdesk","help","support","admin","billing","media","press","jobs","hr","recruit","webmaster","noreply","no-reply","donotreply","do-not-reply"}
-
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 USAGE_PATH = Path(".email_enrich_usage.json")
+
+# --- tldextract offline (prevents network on first call) ---
+EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None, cache_dir=False)
 
 def _today_et_str():
     return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
@@ -49,26 +64,6 @@ def _get_free_cap():
         return 100
 
 # --- Search backends ---
-def _search_serpapi(query: str, num: int = 5):
-    key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
-    if not key:
-        return []
-    url = "https://serpapi.com/search.json"
-    params = {"engine": "google", "q": query, "num": num, "api_key": key}
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        out = []
-        for item in (data.get("organic_results") or [])[:num]:
-            link = item.get("link") or ""
-            title = item.get("title") or ""
-            if link:
-                out.append({"title": title, "url": link})
-        return out
-    except Exception:
-        return []
-
 def _search_google_cse(query: str, num: int = 5):
     api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
     cse_id  = st.secrets.get("GOOGLE_CSE_ID") or os.getenv("GOOGLE_CSE_ID")
@@ -90,19 +85,39 @@ def _search_google_cse(query: str, num: int = 5):
     except Exception:
         return []
 
+def _search_serpapi(query: str, num: int = 5):
+    # Kept for optional provider; returns [] if no key configured
+    key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
+    if not key:
+        return []
+    url = "https://serpapi.com/search.json"
+    params = {"engine": "google", "q": query, "num": num, "api_key": key}
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in (data.get("organic_results") or [])[:num]:
+            link = item.get("link") or ""
+            title = item.get("title") or ""
+            if link:
+                out.append({"title": title, "url": link})
+        return out
+    except Exception:
+        return []
+
 def _search_web(provider: str, query: str, num: int = 5):
     if provider == "SerpAPI":
         return _search_serpapi(query, num=num) or []
     if provider == "Google CSE":
         return _search_google_cse(query, num=num) or []
+    # Auto: prefer SerpAPI if available, else CSE
     hits = _search_serpapi(query, num=num)
     if hits:
         return hits
     return _search_google_cse(query, num=num)
 
-# --- Fetching / crawling (resource-safe) ---
-DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
-
+# --- Fetch / crawl (resource-safe) ---
 def _fetch_html(url: str, timeout=10, max_bytes=750_000) -> str:
     try:
         with requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, stream=True) as r:
@@ -169,6 +184,7 @@ def _collect_internal_links(base_url: str, html_text: str, per_page_limit=6, glo
             out.append(u)
     return out
 
+# --- Extraction / scoring ---
 def _extract_emails_from_html(html_text: str):
     emails = set(EMAIL_REGEX.findall(html_text))
     for rx in OBFUSCATED_REGEXES:
@@ -182,7 +198,7 @@ def _extract_emails_from_html(html_text: str):
     return list(emails)
 
 def _domain(url: str) -> str:
-    ext = tldextract.extract(url)
+    ext = EXTRACTOR(url)
     domain = ".".join(part for part in [ext.domain, ext.suffix] if part)
     return domain.lower()
 
@@ -239,6 +255,7 @@ def _viable_page(url: str) -> bool:
     path = urlparse(url).path.lower()
     return not any(b in path for b in bad)
 
+# --- Core enrichment for a single row ---
 def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None,
                    explore_internal: bool = False, max_internal_pages: int = 24) -> Dict:
     if mode == "Thorough":
@@ -290,6 +307,7 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     log(f"Fetching up to {len(candidates)} pages...", 0.05)
     fetched = _fetch_html_parallel(candidates, timeout=timeout, max_workers=max_workers, cap_total=len(candidates), logger=logger)
 
+    # Optional internal crawl
     if internal_per_page > 0 and internal_total_cap > 0 and (not deadline_ts or time.time() < deadline_ts):
         seen = set()
         more = []
@@ -314,22 +332,34 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     if deadline_ts and time.time() > deadline_ts:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before parsing)"}
 
-    log("Parsing pages for emails...", 0.3)
+    # --- Bounded parsing with heartbeat ---
+    log("Parsing pages for emails...", 0.30)
     emails_found = []
-    for url, html_text in fetched:
+    parsed = 0
+    max_parse = min(len(fetched), 60)  # safety cap
+    for url, html_text in fetched[:max_parse]:
+        if deadline_ts and time.time() > deadline_ts:
+            return {"Found Email":"", "Email Type":"", "Confidence":0,
+                    "Source URL":"", "Notes":"Row time budget exceeded (during parsing)"}
         if not html_text:
             continue
-        txt = html.unescape(html_text)
-        for email in set(EMAIL_REGEX.findall(txt)):
-            emails_found.append((email, url))
-        for rx in OBFUSCATED_REGEXES:
-            for match in rx.findall(txt):
-                if len(match) == 3:
-                    local, domain, tld = match
-                    emails_found.append((f"{local}@{domain}.{tld}", url))
-                elif len(match) == 2:
-                    local, domain = match
-                    emails_found.append((f"{local}@{domain}", url))
+        try:
+            txt = html.unescape(html_text[:300_000])  # cap text size
+            for email in set(EMAIL_REGEX.findall(txt)):
+                emails_found.append((email, url))
+            for rx in OBFUSCATED_REGEXES:
+                for match in rx.findall(txt):
+                    if len(match) == 3:
+                        local, domain, tld = match
+                        emails_found.append((f"{local}@{domain}.{tld}", url))
+                    elif len(match) == 2:
+                        local, domain = match
+                        emails_found.append((f"{local}@{domain}", url))
+        except Exception:
+            pass
+        parsed += 1
+        if logger and parsed % 5 == 0:
+            logger(f"Parsing pages… {parsed}/{max_parse}", 0.30 + 0.60*parsed/max(1, max_parse))
 
     practice_domain = _best_guess_practice_domain(hits) if prac else ""
 
@@ -346,6 +376,7 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     conf = max(0, min(100, 42 + top["score"]))
     return {"Found Email": top["email"], "Email Type": top["type"], "Confidence": conf, "Source URL": top["src"], "Notes": ""}
 
+# --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
 
@@ -364,6 +395,7 @@ def email_enrichment_sidebar(df):
                             help="Auto = prefers SerpAPI (if present), else Google CSE.")
     mode = st.radio("Mode", ["Balanced","Thorough","Fast"], index=0)
 
+    # Controls / status
     status = st.empty()
     row_status = st.empty()
     row_bar = st.progress(0.0)
@@ -430,6 +462,18 @@ def email_enrichment_sidebar(df):
             status.write(f"Row {i}/{total}: {row['First name']} {row['Last name']} — {row.get('Practice Name','')}")
             start_ts = time.time()
             deadline_ts = start_ts + int(row_time_budget)
+
+            # --- Count CSE usage PER ROW (before querying), if limiter is on ---
+            if using_cse and enforce_free:
+                usage = _load_usage()
+                if usage.get("date") != _today_et_str():
+                    usage = {"date": _today_et_str(), "count": 0}
+                cap = _get_free_cap()
+                if int(usage.get("count", 0)) >= cap:
+                    st.warning("Daily free CSE quota reached — stopping.")
+                    break
+                usage["count"] = int(usage.get("count", 0)) + 1
+                _save_usage(usage)
 
             def logger(msg, frac=None):
                 row_status.write(msg)
@@ -509,14 +553,7 @@ def email_enrichment_sidebar(df):
                     applied += int(blanks.sum())
             st.success(f"Applied {applied} emails into the dataset.")
 
-            if using_cse and enforce_free and total:
-                usage = _load_usage()
-                if usage.get("date") != _today_et_str():
-                    usage = {"date": _today_et_str(), "count": 0}
-                usage["count"] = int(usage.get("count", 0)) + total
-                usage["count"] = min(usage["count"], _get_free_cap())
-                _save_usage(usage)
-
+# External helper to apply last reviewed results to a df
 def apply_email_enrichment_results(df, overwrite=False):
     try:
         results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
@@ -542,5 +579,4 @@ def apply_email_enrichment_results(df, overwrite=False):
         return applied, "Applied enrichment results from session."
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
-
 
