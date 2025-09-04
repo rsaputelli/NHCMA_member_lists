@@ -1,5 +1,9 @@
+# Patch the utility to reduce per-row load, add row time budget & heartbeat, and lower concurrency to avoid Cloud restarts.
+from pathlib import Path
+util_path = Path("/mnt/data/email_enrichment_util.py")
 
-# email_enrichment_util.py (quality-first + external apply helper)
+patched = r'''
+# email_enrichment_util.py (stability-safe)
 import os, re, time, json, html, requests
 from typing import List, Dict, Tuple
 from pathlib import Path
@@ -11,9 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from bs4 import BeautifulSoup
 import tldextract
-from rapidfuzz import fuzz, process
 
-# --- Regexes ---
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 OBFUSCATED_REGEXES = [
     re.compile(r"([A-Z0-9._%+-]+)\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*([A-Z0-9.-]+)\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*([A-Z]{2,})", re.I),
@@ -21,7 +23,6 @@ OBFUSCATED_REGEXES = [
 ]
 GENERIC_LOCALPART = {"info","contact","office","frontdesk","help","support","admin","billing","media","press","jobs","hr","recruit","webmaster","noreply","no-reply","donotreply","do-not-reply"}
 
-# --- Daily quota helpers (ET) for Google CSE only ---
 USAGE_PATH = Path(".email_enrich_usage.json")
 
 def _today_et_str():
@@ -52,14 +53,14 @@ def _get_free_cap():
         return 100
 
 # --- Search backends ---
-def _search_serpapi(query: str, num: int = 5) -> List[Dict]:
+def _search_serpapi(query: str, num: int = 5):
     key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
     if not key:
         return []
     url = "https://serpapi.com/search.json"
     params = {"engine": "google", "q": query, "num": num, "api_key": key}
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
         out = []
@@ -72,7 +73,7 @@ def _search_serpapi(query: str, num: int = 5) -> List[Dict]:
     except Exception:
         return []
 
-def _search_google_cse(query: str, num: int = 5) -> List[Dict]:
+def _search_google_cse(query: str, num: int = 5):
     api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
     cse_id  = st.secrets.get("GOOGLE_CSE_ID") or os.getenv("GOOGLE_CSE_ID")
     if not (api_key and cse_id):
@@ -80,7 +81,7 @@ def _search_google_cse(query: str, num: int = 5) -> List[Dict]:
     url = "https://www.googleapis.com/customsearch/v1"
     params = {"key": api_key, "cx": cse_id, "q": query, "num": min(num, 10)}
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
         out = []
@@ -93,7 +94,7 @@ def _search_google_cse(query: str, num: int = 5) -> List[Dict]:
     except Exception:
         return []
 
-def _search_web(provider: str, query: str, num: int = 5) -> List[Dict]:
+def _search_web(provider: str, query: str, num: int = 5):
     if provider == "SerpAPI":
         return _search_serpapi(query, num=num) or []
     if provider == "Google CSE":
@@ -103,34 +104,43 @@ def _search_web(provider: str, query: str, num: int = 5) -> List[Dict]:
         return hits
     return _search_google_cse(query, num=num)
 
-# --- Fetching / crawling ---
+# --- Fetching / crawling (resource-safe) ---
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-def _fetch_html(url: str, timeout=20) -> str:
+def _fetch_html(url: str, timeout=10, max_bytes=750_000) -> str:
     try:
-        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
-        r.raise_for_status()
-        ct = r.headers.get("Content-Type","").lower()
-        if "text" in ct or "html" in ct or "xml" in ct or "json" in ct:
-            return r.text
-        try:
-            return r.content.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
+        with requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, stream=True) as r:
+            r.raise_for_status()
+            # try to read up to max_bytes to avoid OOM on large pages
+            content = b""
+            for chunk in r.iter_content(chunk_size=32_768):
+                content += chunk
+                if len(content) >= max_bytes:
+                    break
+            try:
+                return content.decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
     except Exception:
         return ""
 
-def _fetch_html_parallel(urls, timeout=20, max_workers=6):
+def _fetch_html_parallel(urls, timeout=10, max_workers=4, cap_total=None, logger=None):
+    # Respect a cap on total pages fetched this round
+    urls = urls[:cap_total] if cap_total else urls
     results = []
+    if not urls:
+        return results
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_fetch_html, u, timeout): u for u in urls}
-        for f in as_completed(futs):
+        for idx, f in enumerate(as_completed(futs), start=1):
             u = futs[f]
             try:
-                html = f.result()
+                html_text = f.result()
             except Exception:
-                html = ""
-            results.append((u, html))
+                html_text = ""
+            results.append((u, html_text))
+            if logger:
+                logger(f"Fetched {idx}/{len(urls)} pages", min(0.1 + 0.7*idx/max(1,len(urls)), 0.85))
     return results
 
 def _same_domain(url_a: str, url_b: str) -> bool:
@@ -141,7 +151,7 @@ def _same_domain(url_a: str, url_b: str) -> bool:
     except Exception:
         return False
 
-def _collect_internal_links(base_url: str, html_text: str, limit=30) -> List[str]:
+def _collect_internal_links(base_url: str, html_text: str, per_page_limit=6, global_seen=None):
     try:
         soup = BeautifulSoup(html_text, "html.parser")
     except Exception:
@@ -153,9 +163,11 @@ def _collect_internal_links(base_url: str, html_text: str, limit=30) -> List[str
             continue
         full = urljoin(base_url, href)
         if _same_domain(base_url, full):
-            links.append(full)
-        if len(links) >= limit:
+            if global_seen is None or full not in global_seen:
+                links.append(full)
+        if len(links) >= per_page_limit:
             break
+    # de-dup while preserving order
     seen = set()
     out = []
     for u in links:
@@ -164,8 +176,7 @@ def _collect_internal_links(base_url: str, html_text: str, limit=30) -> List[str
             out.append(u)
     return out
 
-# --- Extraction / scoring ---
-def _extract_emails_from_html(html_text: str) -> List[str]:
+def _extract_emails_from_html(html_text: str):
     emails = set(EMAIL_REGEX.findall(html_text))
     for rx in OBFUSCATED_REGEXES:
         for match in rx.findall(html_text):
@@ -182,7 +193,7 @@ def _domain(url: str) -> str:
     domain = ".".join(part for part in [ext.domain, ext.suffix] if part)
     return domain.lower()
 
-def _score_email(email: str, first: str, last: str, practice_domain: str) -> Tuple[int, str]:
+def _score_email(email: str, first: str, last: str, practice_domain: str):
     local, _, domain = email.lower().partition("@")
     score = 0
     typ = "unknown"
@@ -212,7 +223,7 @@ def _score_email(email: str, first: str, last: str, practice_domain: str) -> Tup
             typ = "other"
     return score, typ
 
-def _best_guess_practice_domain(candidates: List[Dict]) -> str:
+def _best_guess_practice_domain(candidates):
     for hit in candidates[:5]:
         try:
             return _domain(hit["url"])
@@ -235,36 +246,37 @@ def _viable_page(url: str) -> bool:
     path = urlparse(url).path.lower()
     return not any(b in path for b in bad)
 
-def _enrich_single(row: dict, provider: str, mode: str = "Thorough") -> Dict:
+def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None, deadline_ts=None) -> Dict:
+    # Mode caps tuned for Cloud stability
     if mode == "Thorough":
-        search_num = 10
-        suffixes = ("/contact","/contact-us","/team","/providers","/physicians","/about","/faculty","/locations")
-        parallel = 8
-        timeout = 18
-        internal_limit = 40
+        search_num = 10; initial_cap = 40; internal_per_page = 8; internal_total_cap = 120
+        max_workers = 6; timeout = 12
     elif mode == "Fast":
-        search_num = 3
-        suffixes = ("/contact","/team","/providers")
-        parallel = 8
-        timeout = 8
-        internal_limit = 12
+        search_num = 3; initial_cap = 10; internal_per_page = 0; internal_total_cap = 0
+        max_workers = 6; timeout = 6
     else:  # Balanced
-        search_num = 6
-        suffixes = ("/contact","/contact-us","/team","/providers","/physicians")
-        parallel = 6
-        timeout = 12
-        internal_limit = 20
+        search_num = 6; initial_cap = 24; internal_per_page = 6; internal_total_cap = 36
+        max_workers = 4; timeout = 10
+
+    def log(msg, frac=None):
+        if logger:
+            logger(msg, frac)
 
     first = str(row.get("First name","")).strip()
     last  = str(row.get("Last name","")).strip()
     prac  = str(row.get("Practice Name","")).strip()
 
+    if deadline_ts and time.time() > deadline_ts:
+        return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (pre-search)"}
+
     query = _build_query(row)
+    log("Searching...", 0.02)
     hits = _search_web(provider, query, num=search_num)
     if not hits:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"No search results"}
 
     candidates = []
+    suffixes = ("/contact","/contact-us","/team","/providers","/physicians","/about","/faculty","/locations")
     for h in hits:
         base = h["url"].rstrip("/")
         if _viable_page(base):
@@ -273,47 +285,72 @@ def _enrich_single(row: dict, provider: str, mode: str = "Thorough") -> Dict:
             u = base + s
             if _viable_page(u):
                 candidates.append(u)
+    # Global cap for initial pages
+    candidates = list(dict.fromkeys(candidates))[:initial_cap]
 
-    candidates = list(dict.fromkeys(candidates))
-    fetched = _fetch_html_parallel(candidates, timeout=timeout, max_workers=parallel)
+    if deadline_ts and time.time() > deadline_ts:
+        return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before fetch)"}
 
-    if mode in ("Thorough","Balanced"):
+    log(f"Fetching up to {len(candidates)} pages...", 0.05)
+    fetched = _fetch_html_parallel(candidates, timeout=timeout, max_workers=max_workers, cap_total=len(candidates), logger=logger)
+
+    # Crawl internal links only if budget allows
+    if internal_per_page > 0 and internal_total_cap > 0 and (not deadline_ts or time.time() < deadline_ts):
+        seen = set()
         more = []
         for url, html_text in fetched:
             if not html_text:
                 continue
-            more += [u for u in _collect_internal_links(url, html_text, limit=internal_limit) if _viable_page(u)]
-        more = list(dict.fromkeys(more))
-        fetched += _fetch_html_parallel(more, timeout=timeout, max_workers=parallel)
+            links = _collect_internal_links(url, html_text, per_page_limit=internal_per_page, global_seen=seen)
+            for u in links:
+                if u not in seen and _viable_page(u):
+                    seen.add(u)
+                    more.append(u)
+                if len(more) >= internal_total_cap:
+                    break
+            if len(more) >= internal_total_cap:
+                break
+        if more:
+            log(f"Following up to {len(more)} internal links...", 0.15)
+            if deadline_ts and time.time() > deadline_ts:
+                return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before internal)"}
+            fetched += _fetch_html_parallel(more, timeout=timeout, max_workers=max_workers, cap_total=internal_total_cap, logger=logger)
 
+    if deadline_ts and time.time() > deadline_ts:
+        return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before parsing)"}
+
+    log("Parsing pages for emails...", 0.3)
     emails_found = []
     for url, html_text in fetched:
         if not html_text:
             continue
-        text = html.unescape(html_text)
-        for email in _extract_emails_from_html(text):
+        txt = html.unescape(html_text)
+        for email in set(EMAIL_REGEX.findall(txt)):
             emails_found.append((email, url))
+        # obfuscated forms
+        for rx in OBFUSCATED_REGEXES:
+            for match in rx.findall(txt):
+                if len(match) == 3:
+                    local, domain, tld = match
+                    emails_found.append((f"{local}@{domain}.{tld}", url))
+                elif len(match) == 2:
+                    local, domain = match
+                    emails_found.append((f"{local}@{domain}", url))
 
     practice_domain = _best_guess_practice_domain(hits) if prac else ""
 
     ranked = []
     for email, src in set(emails_found):
-        score, typ = _score_email(email, first, last, practice_domain)
-        ranked.append({"email": email, "score": score, "type": typ, "src": src})
+        sc, typ = _score_email(email, first, last, practice_domain)
+        ranked.append({"email": email, "score": sc, "type": typ, "src": src})
 
     if not ranked:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":hits[0]["url"], "Notes":"No emails on scanned pages"}
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
     top = ranked[0]
-    confidence = max(0, min(100, 42 + top["score"]))
-    return {
-        "Found Email": top["email"],
-        "Email Type": top["type"],
-        "Confidence": confidence,
-        "Source URL": top["src"],
-        "Notes": (f"Practice domain guess: {practice_domain}" if practice_domain else "") + (f" • mode={mode}" if mode else ""),
-    }
+    conf = max(0, min(100, 42 + top["score"]))
+    return {"Found Email": top["email"], "Email Type": top["type"], "Confidence": conf, "Source URL": top["src"], "Notes": ""}
 
 def email_enrichment_sidebar(df):
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
@@ -323,25 +360,33 @@ def email_enrichment_sidebar(df):
     g_cx     = st.secrets.get("GOOGLE_CSE_ID")  or os.getenv("GOOGLE_CSE_ID")
 
     available = []
-    if serp_key:
-        available.append("SerpAPI")
-    if g_api and g_cx:
-        available.append("Google CSE")
+    if serp_key: available.append("SerpAPI")
+    if g_api and g_cx: available.append("Google CSE")
     if not available:
         st.error("No search API configured. Add SERPAPI_KEY or GOOGLE_API_KEY + GOOGLE_CSE_ID to Streamlit secrets.")
         return
 
     provider = st.selectbox("Search provider", ["Auto"] + available, index=0,
                             help="Auto = prefers SerpAPI (if present), else Google CSE.")
-    mode = st.radio("Mode", ["Thorough", "Balanced", "Fast"], index=0,
-                    help="Thorough: best chance to find direct emails (slow). Fast: fewer pages & shorter timeouts.")
+    mode = st.radio("Mode", ["Balanced","Thorough","Fast"], index=0)
+
+    # Heartbeat / stop / row time budget
+    status = st.empty()
+    row_status = st.empty()
+    row_bar = st.progress(0.0)
+    c1, c2 = st.columns([1,2])
+    with c1:
+        if st.button("⏹️ Stop run", key="stop_run_btn", width='content'):
+            st.session_state["_abort_enrich"] = True
+    st.session_state.setdefault("_abort_enrich", False)
+    row_time_budget = st.number_input("Per-row time budget (sec)", min_value=60, max_value=600, value=180, step=30,
+                                      help="Skip to next row if a site is too slow.")
 
     using_cse = (provider == "Google CSE") or (provider == "Auto" and not serp_key and (g_api and g_cx))
     if using_cse:
-        st.info("Using Google CSE • Free tier is 100 queries/day. Capped by default.")
+        st.info("Using Google CSE • Free tier ~100 queries/day. Capped by default.")
         enforce_free = st.toggle("Never exceed free tier (100/day)", value=True)
-        usage = _load_usage()
-        cap   = _get_free_cap()
+        usage = _load_usage(); cap = _get_free_cap()
         remaining = max(0, cap - int(usage.get("count", 0)))
         st.write(f"**Remaining today (ET): {remaining} / {cap}**")
     else:
@@ -362,21 +407,19 @@ def email_enrichment_sidebar(df):
 
     default_limit = min(25, len(candidates_df))
     max_limit = len(candidates_df)
-
     if using_cse and enforce_free:
-        usage = _load_usage()
-        cap   = _get_free_cap()
+        usage = _load_usage(); cap = _get_free_cap()
         remaining = max(0, cap - int(usage.get("count", 0)))
         if remaining == 0:
-            st.warning("Daily free CSE quota reached. Try again tomorrow or disable the cap to allow paid overage.")
+            st.warning("Daily free CSE quota reached.")
         max_limit = min(max_limit, remaining)
 
     limit = st.number_input("Max records to scan", min_value=0, max_value=int(max_limit), value=int(min(default_limit, max_limit)))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
 
-    autosave_every = st.number_input("Autosave results every N rows", min_value=1, max_value=100, value=10, step=1)
+    autosave_every = st.number_input("Autosave every N rows", min_value=1, max_value=100, value=10, step=1)
 
-    if st.button("Run email search", disabled=(max_limit == 0)):
+    if st.button("Run email search", key="run_search_btn", width='content', disabled=(max_limit == 0)):
         total = int(limit)
         if total <= 0:
             st.info("Nothing to process with current settings.")
@@ -385,7 +428,23 @@ def email_enrichment_sidebar(df):
         progress = st.progress(0.0)
         results = []
         for i, (_, row) in enumerate(subset.iterrows(), start=1):
-            res = _enrich_single(row.to_dict(), provider, mode=mode)
+            if st.session_state.get("_abort_enrich"):
+                st.warning("Run stopped by user.")
+                break
+
+            status.write(f"Row {i}/{total}: {row['First name']} {row['Last name']} — {row.get('Practice Name','')}")
+            start_ts = time.time()
+            deadline_ts = start_ts + int(row_time_budget)
+
+            def logger(msg, frac=None):
+                row_status.write(msg)
+                if frac is not None:
+                    row_bar.progress(min(max(frac, 0.0), 0.95))
+
+            res = _enrich_single(row.to_dict(), provider, mode=mode, logger=logger, deadline_ts=deadline_ts)
+            row_bar.progress(1.0)
+            row_status.write("Row done.")
+
             rec = {
                 "First name": row["First name"],
                 "Last name": row["Last name"],
@@ -402,7 +461,6 @@ def email_enrichment_sidebar(df):
             results.append(rec)
             if i % int(autosave_every) == 0:
                 st.session_state["_enrich_partial"] = results.copy()
-                st.session_state["_email_enrich_results"] = results.copy()
             progress.progress(i/total)
 
         if not results:
@@ -412,11 +470,10 @@ def email_enrichment_sidebar(df):
         st.session_state["_enrich_partial"] = results.copy()
         edited = st.data_editor(
             results,
-            use_container_width=True,
+            width='stretch',
             num_rows="fixed",
             key="email_enrich_editor"
         )
-        # Persist edited to session so an external button can apply
         st.session_state["_email_enrich_results"] = edited
 
         st.write("Tip: uncheck **Approve** for generic inboxes you don’t want to use.")
@@ -430,11 +487,12 @@ def email_enrichment_sidebar(df):
                 delta.to_csv(index=False).encode("utf-8"),
                 file_name="email_enrichment_results.csv",
                 mime="text/csv",
+                width='content'
             )
         except Exception:
             pass
 
-        if st.button("Apply approved emails to Data"):
+        if st.button("Apply approved emails to Data", key="apply_btn", width='content'):
             applied = 0
             for rec in edited:
                 if not rec.get("Approve") or not rec.get("Suggested Email"):
@@ -462,20 +520,7 @@ def email_enrichment_sidebar(df):
                 usage["count"] = min(usage["count"], _get_free_cap())
                 _save_usage(usage)
 
-    with st.expander("Setup & Notes"):
-        st.markdown("""- **Data used**: only publicly visible, professional emails.
-- **Modes**: *Thorough* scans more pages (best results, slow). *Fast* scans fewer pages.
-- **Confidence**: higher when domain matches practice and local-part includes the last name.
-- **API**: use SERPAPI_KEY or GOOGLE_API_KEY + GOOGLE_CSE_ID in secrets.""")
-
 def apply_email_enrichment_results(df, overwrite=False):
-    """
-    Apply the most recent enrichment results saved in session_state
-    to 'df'. Reads from:
-      - st.session_state["_email_enrich_results"] if present,
-        otherwise falls back to st.session_state["_enrich_partial"].
-    Returns (applied_count, message).
-    """
     try:
         results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
         if not results:
@@ -500,3 +545,17 @@ def apply_email_enrichment_results(df, overwrite=False):
         return applied, "Applied enrichment results from session."
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
+'''
+util_path.write_text(patched, encoding="utf-8")
+
+# Also ensure the standalone page uses width= API consistently.
+page_path = Path("/mnt/data/pages/02_Email_Search_Utility.py")
+if page_path.exists():
+    pg = page_path.read_text(encoding="utf-8", errors="ignore")
+    pg = pg.replace("use_container_width=True", "width='stretch'")
+    pg = pg.replace("use_container_width=False", "width='content'")
+    # Ensure imports still valid
+    page_path.write_text(pg, encoding="utf-8")
+
+print("Patched utility for stability and updated page widths.")
+
