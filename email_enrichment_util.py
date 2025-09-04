@@ -1,17 +1,11 @@
 
-# email_enrichment_util.py — FINAL (import-safe) PERSIST + SERPAPI MONTHLY CAP
-# Features:
-# • Modes: Fast / Balanced / Thorough
-# • Heartbeat status + row mini progress bar
-# • ⏹ Stop run button
-# • Per-row time budget (sec)
-# • Optional internal-link exploration (toggle) with cap
-# • Bounded parsing (caps pages & text; yields heartbeat)
-# • tldextract offline extractor (no network)
-# • Google CSE free-tier limiter counted PER ROW before search (daily)
-# • SerpAPI optional provider with monthly cap (toggle)
-# • Streamlit new width API: width='stretch'|'content'
-# • NEW: Persistent results renderer (editor + downloads + apply) always visible
+# email_enrichment_util.py — FINAL (import-safe)
+# PERSISTENT RESULTS + SERPAPI MONTHLY CAP + SKIP-NON-APPROVED + OPTIONAL PERSISTED SKIP LIST + START OFFSET
+#
+# Adds since prior drop:
+# • Toggle: "Persist skip list across restarts" -> writes/reads .email_enrich_skiplist.json
+# • Button: "Reset PERSISTED skipped list"
+# • New control: "Start at row N (within current candidates)" to offset into the remaining pool
 
 import os, re, time, json, html, requests, io
 from typing import List, Dict, Tuple
@@ -36,6 +30,7 @@ GENERIC_LOCALPART = {"info","contact","office","frontdesk","help","support","adm
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 USAGE_PATH = Path(".email_enrich_usage.json")              # CSE daily
 SERP_USAGE_PATH = Path(".serpapi_usage.json")              # SerpAPI monthly
+SKIPLIST_PATH = Path(".email_enrich_skiplist.json")        # persisted skip keys
 
 # --- tldextract offline (prevents network on first call) ---
 EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None, cache_dir=False)
@@ -89,6 +84,29 @@ def _get_free_cap():
         return int(st.secrets.get("FREE_TIER_DAILY_LIMIT", 100))
     except Exception:
         return 100
+
+def _row_key3(first, last, practice):
+    return (str(first).strip().lower(), str(last).strip().lower(), str(practice or "").strip().lower())
+
+# --- persisted skip list helpers ---
+def _load_persisted_skiplist():
+    try:
+        if SKIPLIST_PATH.exists():
+            data = json.loads(SKIPLIST_PATH.read_text())
+            if isinstance(data, list):
+                # ensure tuples
+                return [tuple(x) for x in data]
+    except Exception:
+        pass
+    return []
+
+def _save_persisted_skiplist(keys):
+    try:
+        # keys is list of tuples -> serialize as list of lists
+        data = [list(t) for t in keys]
+        SKIPLIST_PATH.write_text(json.dumps(data))
+    except Exception:
+        pass
 
 # --- Search backends ---
 def _search_google_cse(query: str, num: int = 5):
@@ -405,34 +423,58 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     return {"Found Email": top["email"], "Email Type": top["type"], "Confidence": conf, "Source URL": top["src"], "Notes": ""}
 
 # --- External helper to apply last reviewed results to a df (persist-safe) ---
-def apply_email_enrichment_results(df, overwrite=False):
+def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
     try:
         results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
         if not results:
             return 0, "No enrichment results found in session."
         applied = 0
+        # Ensure blacklist exists
+        st.session_state.setdefault("_email_enrich_blacklist", [])
+        blacklist = st.session_state["_email_enrich_blacklist"]
+
         for rec in results:
-            if not rec.get("Approve") or not rec.get("Suggested Email"):
-                continue
-            mask = (
-                (df["First name"].astype(str).str.strip() == str(rec["First name"]).strip()) &
-                (df["Last name"].astype(str).str.strip() == str(rec["Last name"]).strip())
-            )
-            if "Practice Name" in df.columns and str(rec.get("Practice Name","")).strip():
-                mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(rec["Practice Name"]).strip())
-            if overwrite:
-                df.loc[mask, "Email"] = rec["Suggested Email"]
-                applied += int(mask.sum())
+            approved = bool(rec.get("Approve"))
+            suggested = str(rec.get("Suggested Email") or "").strip()
+            fn = rec.get("First name","")
+            ln = rec.get("Last name","")
+            pn = rec.get("Practice Name","")
+            key = list(_row_key3(fn, ln, pn))
+
+            # Apply if approved + suggested present
+            if approved and suggested:
+                mask = (
+                    (df["First name"].astype(str).str.strip() == str(fn).strip()) &
+                    (df["Last name"].astype(str).str.strip() == str(ln).strip())
+                )
+                if "Practice Name" in df.columns and str(pn).strip():
+                    mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(pn).strip())
+                if overwrite:
+                    df.loc[mask, "Email"] = suggested
+                    applied += int(mask.sum())
+                else:
+                    blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
+                    df.loc[blanks, "Email"] = suggested
+                    applied += int(blanks.sum())
             else:
-                blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
-                df.loc[blanks, "Email"] = rec["Suggested Email"]
-                applied += int(blanks.sum())
-        return applied, "Applied enrichment results from session."
+                # Not approved OR no suggestion -> add to session blacklist
+                if key not in blacklist:
+                    blacklist.append(key)
+
+        st.session_state["_email_enrich_blacklist"] = blacklist
+
+        # Persist skip list if requested
+        if persist_skip:
+            existing = set(_load_persisted_skiplist())
+            merged = existing.union(set(tuple(x) for x in blacklist))
+            _save_persisted_skiplist(list(merged))
+
+        return applied, f"Applied enrichment results. Skipped rows (not approved) now tracked; session skip list size: {len(blacklist)}."
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
 
 # --- Persistent results renderer (always show editor + downloads + apply if present) ---
-def render_email_enrichment_results(df=None, overwrite=False):
+def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False):
     try:
         results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
         if not results:
@@ -472,7 +514,7 @@ def render_email_enrichment_results(df=None, overwrite=False):
         # Apply button (persistent)
         if df is not None:
             if st.button("Apply approved emails to Data", key="apply_btn_persist"):
-                applied, msg = apply_email_enrichment_results(df, overwrite=overwrite)
+                applied, msg = apply_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
                 st.success(f"{msg} Updated rows: {applied}")
     except Exception as e:
         st.warning(f"Could not render results: {e}")
@@ -502,7 +544,7 @@ def email_enrichment_sidebar(df):
     row_bar = st.progress(0.0)
     c1, c2 = st.columns([2,2])
     with c1:
-        if st.button("⏹️ Stop run", key="stop_run_btn", width='content'):
+        if st.button("⏹️ Stop run", key="stop_run_btn", type="secondary"):
             st.session_state["_abort_enrich"] = True
     st.session_state.setdefault("_abort_enrich", False)
     row_time_budget = st.number_input("Per-row time budget (sec)", min_value=60, max_value=600, value=180, step=30,
@@ -538,6 +580,26 @@ def email_enrichment_sidebar(df):
         st.warning(f"Missing required columns: {', '.join(missing)}")
         return
 
+    # --- Skip list controls ---
+    st.session_state.setdefault("_email_enrich_blacklist", [])
+    persist_skip = st.toggle("Persist skip list across restarts", value=False,
+                             help="Writes not-approved rows to a local JSON so they remain skipped after reloads.")
+    if persist_skip and not st.session_state.get("_skip_loaded", False):
+        # Merge persisted list into session on first time enabling
+        persisted = _load_persisted_skiplist()
+        if persisted:
+            merged = set(tuple(x) for x in st.session_state["_email_enrich_blacklist"]).union(set(persisted))
+            st.session_state["_email_enrich_blacklist"] = [list(t) for t in merged]
+        st.session_state["_skip_loaded"] = True
+
+    if st.button("Reset PERSISTED skipped list", key="reset_persist_blacklist", type="secondary"):
+        try:
+            if SKIPLIST_PATH.exists():
+                SKIPLIST_PATH.unlink()
+            st.success("Persisted skip list cleared (session skip list unchanged).")
+        except Exception as e:
+            st.warning(f"Could not clear persisted skip list: {e}")
+
     overwrite = st.checkbox("Overwrite existing Email values", value=False)
 
     if overwrite:
@@ -545,6 +607,23 @@ def email_enrichment_sidebar(df):
     else:
         candidates_df = df[df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")]
 
+    # Skip list (session and optionally persisted)
+    skip_attempted = st.toggle("Skip already attempted this session", value=True,
+                               help="Skips rows you did not approve in prior runs this session (created when you click Apply).")
+    if skip_attempted:
+        bl = set(tuple(x) for x in st.session_state["_email_enrich_blacklist"])
+        def _key_from_row(r):
+            return _row_key3(r["First name"], r["Last name"], r.get("Practice Name",""))
+        mask_skip = candidates_df.apply(lambda r: _key_from_row(r) in bl, axis=1)
+        if mask_skip.any():
+            st.caption(f"Skipping {int(mask_skip.sum())} previously attempted rows this session.")
+            candidates_df = candidates_df[~mask_skip]
+
+    if st.button("Reset skipped list (SESSION)", key="reset_blacklist", type="secondary"):
+        st.session_state["_email_enrich_blacklist"] = []
+        st.success("Session skip list cleared.")
+
+    # --- Batching & offsets ---
     usage = _load_usage(); cap = _get_free_cap()
     remaining = max(0, cap - int(usage.get("count", 0)))
     default_limit = min(25, len(candidates_df))
@@ -552,7 +631,9 @@ def email_enrichment_sidebar(df):
     if using_cse and enforce_free:
         max_limit = min(max_limit, remaining)
 
-    limit = st.number_input("Max records to scan", min_value=0, max_value=int(max_limit), value=int(min(default_limit, max_limit)))
+    start_offset = st.number_input("Start at row N (within current candidates)", min_value=0, max_value=int(max_limit), value=0,
+                                   help="Offsets into the remaining candidate pool after filters & skip list are applied.")
+    limit = st.number_input("Max records to scan", min_value=0, max_value=int(max(0, max_limit - start_offset)), value=int(min(default_limit, max(0, max_limit - start_offset))))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
     autosave_every = st.number_input("Autosave every N rows", min_value=1, max_value=100, value=10, step=1)
 
@@ -561,7 +642,7 @@ def email_enrichment_sidebar(df):
     if have_results:
         st.markdown("After running, you can apply or download again here:")
         if st.button("Apply approved (from sidebar)", key="apply_from_sidebar"):
-            applied, msg = apply_email_enrichment_results(df, overwrite=overwrite)
+            applied, msg = apply_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
             st.success(f"{msg} Updated rows: {applied}")
         try:
             res = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
@@ -588,18 +669,24 @@ def email_enrichment_sidebar(df):
             pass
 
     if st.button("Run email search", key="run_search_btn", disabled=(max_limit == 0)):
-        total = int(limit)
+        # Effective total based on offset
+        avail = max(0, len(candidates_df) - int(start_offset))
+        total = min(int(limit), avail)
         if total <= 0:
-            st.info("Nothing to process with current settings.")
+            st.info("Nothing to process with current settings (check offset / limit).")
             return
 
         # Clear old results (fresh run)
         st.session_state["_email_enrich_results"] = None
         st.session_state["_enrich_partial"] = None
 
-        subset = candidates_df.head(total).copy()
+        subset = candidates_df.iloc[int(start_offset):int(start_offset)+total].copy()
         progress = st.progress(0.0)
         results = []
+
+        # Determine caps once per run
+        using_serp_pref = (provider == "SerpAPI") or (provider == "Auto" and bool(serp_key))
+        using_cse = (provider == "Google CSE") or (provider == "Auto" and not bool(serp_key) and (g_api and g_cx))
 
         for i, (_, row) in enumerate(subset.iterrows(), start=1):
             if st.session_state.get("_abort_enrich"):
@@ -666,7 +753,7 @@ def email_enrichment_sidebar(df):
         if not results:
             st.info("No results.")
             # Even if empty, try to render any previous results
-            render_email_enrichment_results(df, overwrite=overwrite)
+            render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
             return
 
         st.session_state["_enrich_partial"] = results.copy()
@@ -679,10 +766,10 @@ def email_enrichment_sidebar(df):
         )
         st.session_state["_email_enrich_results"] = edited
 
-        st.write("Tip: uncheck **Approve** for generic inboxes you don’t want to use.")
-        render_email_enrichment_results(df, overwrite=overwrite)
+        st.write("Tip: leave **Approve** unchecked for generic/low-confidence inboxes. On Apply, those rows are added to the skip list.")
+        render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
 
     # Always show results area if any exist
-    render_email_enrichment_results(df, overwrite=overwrite)
+    render_email_enrichment_results(df, overwrite=overwrite, persist_skip=persist_skip)
 
 
