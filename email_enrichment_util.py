@@ -1,5 +1,5 @@
 
-# email_enrichment_util.py — FINAL (import-safe)
+# email_enrichment_util.py — FINAL (import-safe) PERSIST + SERPAPI MONTHLY CAP
 # Features:
 # • Modes: Fast / Balanced / Thorough
 # • Heartbeat status + row mini progress bar
@@ -8,10 +8,12 @@
 # • Optional internal-link exploration (toggle) with cap
 # • Bounded parsing (caps pages & text; yields heartbeat)
 # • tldextract offline extractor (no network)
-# • Google CSE free-tier limiter counted PER ROW before search
+# • Google CSE free-tier limiter counted PER ROW before search (daily)
+# • SerpAPI optional provider with monthly cap (toggle)
 # • Streamlit new width API: width='stretch'|'content'
+# • NEW: Persistent results renderer (editor + downloads + apply) always visible
 
-import os, re, time, json, html, requests
+import os, re, time, json, html, requests, io
 from typing import List, Dict, Tuple
 from pathlib import Path
 from datetime import datetime
@@ -22,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from bs4 import BeautifulSoup
 import tldextract
+import pandas as pd
 
 # --- Regexes / constants ---
 EMAIL_REGEX = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
@@ -31,7 +34,8 @@ OBFUSCATED_REGEXES = [
 ]
 GENERIC_LOCALPART = {"info","contact","office","frontdesk","help","support","admin","billing","media","press","jobs","hr","recruit","webmaster","noreply","no-reply","donotreply","do-not-reply"}
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
-USAGE_PATH = Path(".email_enrich_usage.json")
+USAGE_PATH = Path(".email_enrich_usage.json")              # CSE daily
+SERP_USAGE_PATH = Path(".serpapi_usage.json")              # SerpAPI monthly
 
 # --- tldextract offline (prevents network on first call) ---
 EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None, cache_dir=False)
@@ -39,7 +43,11 @@ EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None, cache_dir=False)
 def _today_et_str():
     return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
+def _month_key():
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m")
+
 def _load_usage():
+    # Google CSE daily usage
     today = _today_et_str()
     usage = {"date": today, "count": 0}
     try:
@@ -57,7 +65,26 @@ def _save_usage(usage: dict):
     except Exception:
         pass
 
+def _load_serp_month_usage():
+    key = _month_key()
+    usage = {"month": key, "count": 0}
+    try:
+        if SERP_USAGE_PATH.exists():
+            data = json.loads(SERP_USAGE_PATH.read_text())
+            if data.get("month") == key:
+                usage = data
+    except Exception:
+        pass
+    return usage
+
+def _save_serp_month_usage(usage: dict):
+    try:
+        SERP_USAGE_PATH.write_text(json.dumps(usage))
+    except Exception:
+        pass
+
 def _get_free_cap():
+    # Google CSE free tier daily cap (configurable via secrets)
     try:
         return int(st.secrets.get("FREE_TIER_DAILY_LIMIT", 100))
     except Exception:
@@ -86,7 +113,6 @@ def _search_google_cse(query: str, num: int = 5):
         return []
 
 def _search_serpapi(query: str, num: int = 5):
-    # Kept for optional provider; returns [] if no key configured
     key = st.secrets.get("SERPAPI_KEY") or os.getenv("SERPAPI_KEY")
     if not key:
         return []
@@ -285,7 +311,7 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
 
     query = _build_query(row)
     log("Searching...", 0.02)
-    hits = _search_web(provider, query, num=search_num)
+    hits = _search_web(provider, query, num=6 if mode!="Thorough" else 10)
     if not hits:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"No search results"}
 
@@ -299,15 +325,17 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
             u = base + s
             if _viable_page(u):
                 candidates.append(u)
-    candidates = list(dict.fromkeys(candidates))[:initial_cap]
+    candidates = list(dict.fromkeys(candidates))[:(24 if mode=="Thorough" else (10 if mode=="Fast" else 18))]
 
     if deadline_ts and time.time() > deadline_ts:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before fetch)"}
 
     log(f"Fetching up to {len(candidates)} pages...", 0.05)
-    fetched = _fetch_html_parallel(candidates, timeout=timeout, max_workers=max_workers, cap_total=len(candidates), logger=logger)
+    fetched = _fetch_html_parallel(candidates, timeout=(12 if mode=="Thorough" else (6 if mode=="Fast" else 10)), max_workers=(6 if mode!="Balanced" else 4), cap_total=len(candidates), logger=logger)
 
     # Optional internal crawl
+    internal_per_page = 8 if (mode=="Thorough" and explore_internal) else (6 if (mode=="Balanced" and explore_internal) else 0)
+    internal_total_cap = min(120 if mode=="Thorough" else 36, max_internal_pages) if explore_internal else 0
     if internal_per_page > 0 and internal_total_cap > 0 and (not deadline_ts or time.time() < deadline_ts):
         seen = set()
         more = []
@@ -327,7 +355,7 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
             log(f"Following up to {len(more)} internal links...", 0.15)
             if deadline_ts and time.time() > deadline_ts:
                 return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before internal)"}
-            fetched += _fetch_html_parallel(more, timeout=timeout, max_workers=max_workers, cap_total=internal_total_cap, logger=logger)
+            fetched += _fetch_html_parallel(more, timeout=(12 if mode=="Thorough" else 10), max_workers=(6 if mode!="Balanced" else 4), cap_total=internal_total_cap, logger=logger)
 
     if deadline_ts and time.time() > deadline_ts:
         return {"Found Email":"", "Email Type":"", "Confidence":0, "Source URL":"", "Notes":"Row time budget exceeded (before parsing)"}
@@ -376,6 +404,79 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
     conf = max(0, min(100, 42 + top["score"]))
     return {"Found Email": top["email"], "Email Type": top["type"], "Confidence": conf, "Source URL": top["src"], "Notes": ""}
 
+# --- External helper to apply last reviewed results to a df (persist-safe) ---
+def apply_email_enrichment_results(df, overwrite=False):
+    try:
+        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
+        if not results:
+            return 0, "No enrichment results found in session."
+        applied = 0
+        for rec in results:
+            if not rec.get("Approve") or not rec.get("Suggested Email"):
+                continue
+            mask = (
+                (df["First name"].astype(str).str.strip() == str(rec["First name"]).strip()) &
+                (df["Last name"].astype(str).str.strip() == str(rec["Last name"]).strip())
+            )
+            if "Practice Name" in df.columns and str(rec.get("Practice Name","")).strip():
+                mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(rec["Practice Name"]).strip())
+            if overwrite:
+                df.loc[mask, "Email"] = rec["Suggested Email"]
+                applied += int(mask.sum())
+            else:
+                blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
+                df.loc[blanks, "Email"] = rec["Suggested Email"]
+                applied += int(blanks.sum())
+        return applied, "Applied enrichment results from session."
+    except Exception as e:
+        return 0, f"Failed to apply enrichment results: {e}"
+
+# --- Persistent results renderer (always show editor + downloads + apply if present) ---
+def render_email_enrichment_results(df=None, overwrite=False):
+    try:
+        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
+        if not results:
+            return
+        st.subheader("Email Enrichment Results")
+        edited = st.data_editor(
+            results,
+            width='stretch',
+            num_rows="fixed",
+            key="email_enrich_editor_persistent"
+        )
+        # Keep edited copy in session
+        st.session_state["_email_enrich_results"] = edited
+
+        df_out = pd.DataFrame(edited)
+
+        st.download_button(
+            "Download enrichment results (CSV)",
+            df_out.to_csv(index=False).encode("utf-8"),
+            file_name="email_enrichment_results.csv",
+            mime="text/csv",
+            key="dl_results_csv_persist",
+        )
+
+        # Optional XLSX
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            df_out.to_excel(xw, index=False, sheet_name="Results")
+        st.download_button(
+            "Download enrichment results (Excel)",
+            data=buf.getvalue(),
+            file_name="email_enrichment_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_results_xlsx_persist",
+        )
+
+        # Apply button (persistent)
+        if df is not None:
+            if st.button("Apply approved emails to Data", key="apply_btn_persist"):
+                applied, msg = apply_email_enrichment_results(df, overwrite=overwrite)
+                st.success(f"{msg} Updated rows: {applied}")
+    except Exception as e:
+        st.warning(f"Could not render results: {e}")
+
 # --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
@@ -410,15 +511,26 @@ def email_enrichment_sidebar(df):
     max_internal_pages = st.slider("Max internal pages", 0, 120, 24, step=6,
                                    help="Upper bound when exploring internal links. Set 0 to disable.")
 
-    using_cse = (provider == "Google CSE") or (provider == "Auto" and not serp_key and (g_api and g_cx))
+    # Determine which cap to display
+    using_serp_pref = (provider == "SerpAPI") or (provider == "Auto" and bool(serp_key))
+    using_cse = (provider == "Google CSE") or (provider == "Auto" and not bool(serp_key) and (g_api and g_cx))
+
+    enforce_free = False
+    respect_serp_cap = False
+
     if using_cse:
         st.info("Using Google CSE • Free tier ~100 queries/day. Capped by default.")
-        enforce_free = st.toggle("Never exceed free tier (100/day)", value=True)
+        enforce_free = st.toggle("Never exceed free tier (100/day)", value=True, key="cse_cap_toggle")
         usage = _load_usage(); cap = _get_free_cap()
         remaining = max(0, cap - int(usage.get("count", 0)))
         st.write(f"**Remaining today (ET): {remaining} / {cap}**")
-    else:
-        enforce_free = False
+
+    if using_serp_pref:
+        st.info("Using SerpAPI • Free tier ~250 queries/month.")
+        respect_serp_cap = st.toggle("Respect SerpAPI free tier (250/month)", value=True, key="serp_cap_toggle")
+        su = _load_serp_month_usage()
+        remaining_mo = max(0, 250 - int(su.get("count", 0)))
+        st.write(f"**Remaining this month (ET): {remaining_mo} / 250**")
 
     needed = ["First name","Last name","Practice Name","City","State","Email"]
     missing = [c for c in needed if c not in df.columns]
@@ -433,27 +545,62 @@ def email_enrichment_sidebar(df):
     else:
         candidates_df = df[df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")]
 
+    usage = _load_usage(); cap = _get_free_cap()
+    remaining = max(0, cap - int(usage.get("count", 0)))
     default_limit = min(25, len(candidates_df))
     max_limit = len(candidates_df)
     if using_cse and enforce_free:
-        usage = _load_usage(); cap = _get_free_cap()
-        remaining = max(0, cap - int(usage.get("count", 0)))
-        if remaining == 0:
-            st.warning("Daily free CSE quota reached.")
         max_limit = min(max_limit, remaining)
 
     limit = st.number_input("Max records to scan", min_value=0, max_value=int(max_limit), value=int(min(default_limit, max_limit)))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
     autosave_every = st.number_input("Autosave every N rows", min_value=1, max_value=100, value=10, step=1)
 
-    if st.button("Run email search", key="run_search_btn", width='content', disabled=(max_limit == 0)):
+    # Sidebar persistent actions if results exist
+    have_results = bool(st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial"))
+    if have_results:
+        st.markdown("After running, you can apply or download again here:")
+        if st.button("Apply approved (from sidebar)", key="apply_from_sidebar"):
+            applied, msg = apply_email_enrichment_results(df, overwrite=overwrite)
+            st.success(f"{msg} Updated rows: {applied}")
+        try:
+            res = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
+            if res:
+                df_out = pd.DataFrame(res)
+                st.download_button(
+                    "Download Enriched CSV (from sidebar)",
+                    df_out.to_csv(index=False).encode("utf-8"),
+                    file_name="email_enrichment_results.csv",
+                    mime="text/csv",
+                    key="dl_sidebar_csv",
+                )
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+                    df_out.to_excel(xw, index=False, sheet_name="Results")
+                st.download_button(
+                    "Download Enriched Excel (from sidebar)",
+                    data=buf.getvalue(),
+                    file_name="email_enrichment_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_sidebar_xlsx",
+                )
+        except Exception:
+            pass
+
+    if st.button("Run email search", key="run_search_btn", disabled=(max_limit == 0)):
         total = int(limit)
         if total <= 0:
             st.info("Nothing to process with current settings.")
             return
+
+        # Clear old results (fresh run)
+        st.session_state["_email_enrich_results"] = None
+        st.session_state["_enrich_partial"] = None
+
         subset = candidates_df.head(total).copy()
         progress = st.progress(0.0)
         results = []
+
         for i, (_, row) in enumerate(subset.iterrows(), start=1):
             if st.session_state.get("_abort_enrich"):
                 st.warning("Run stopped by user.")
@@ -474,6 +621,17 @@ def email_enrichment_sidebar(df):
                     break
                 usage["count"] = int(usage.get("count", 0)) + 1
                 _save_usage(usage)
+
+            # --- SerpAPI monthly limiter (before querying) ---
+            if using_serp_pref and respect_serp_cap:
+                su = _load_serp_month_usage()
+                if su.get("month") != _month_key():
+                    su = {"month": _month_key(), "count": 0}
+                if int(su.get("count", 0)) >= 250:
+                    st.warning("Monthly free SerpAPI quota reached — stopping.")
+                    break
+                su["count"] = int(su.get("count", 0)) + 1
+                _save_serp_month_usage(su)
 
             def logger(msg, frac=None):
                 row_status.write(msg)
@@ -507,76 +665,24 @@ def email_enrichment_sidebar(df):
 
         if not results:
             st.info("No results.")
+            # Even if empty, try to render any previous results
+            render_email_enrichment_results(df, overwrite=overwrite)
             return
 
         st.session_state["_enrich_partial"] = results.copy()
+        # Initial editor view (immediate), then persistently render
         edited = st.data_editor(
             results,
             width='stretch',
             num_rows="fixed",
-            key="email_enrich_editor"
+            key="email_enrich_editor_first"
         )
         st.session_state["_email_enrich_results"] = edited
 
         st.write("Tip: uncheck **Approve** for generic inboxes you don’t want to use.")
+        render_email_enrichment_results(df, overwrite=overwrite)
 
-        try:
-            import pandas as pd
-            delta = pd.DataFrame(edited)
-            st.download_button(
-                "Download enrichment results (CSV)",
-                delta.to_csv(index=False).encode("utf-8"),
-                file_name="email_enrichment_results.csv",
-                mime="text/csv",
-                width='content'
-            )
-        except Exception:
-            pass
+    # Always show results area if any exist
+    render_email_enrichment_results(df, overwrite=overwrite)
 
-        if st.button("Apply approved emails to Data", key="apply_btn", width='content'):
-            applied = 0
-            for rec in edited:
-                if not rec.get("Approve") or not rec.get("Suggested Email"):
-                    continue
-                mask = (
-                    (df["First name"].astype(str).str.strip() == str(rec["First name"]).strip()) &
-                    (df["Last name"].astype(str).str.strip() == str(rec["Last name"]).strip())
-                )
-                if "Practice Name" in df.columns and str(rec.get("Practice Name","")).strip():
-                    mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(rec["Practice Name"]).strip())
-                if overwrite:
-                    df.loc[mask, "Email"] = rec["Suggested Email"]
-                    applied += int(mask.sum())
-                else:
-                    blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
-                    df.loc[blanks, "Email"] = rec["Suggested Email"]
-                    applied += int(blanks.sum())
-            st.success(f"Applied {applied} emails into the dataset.")
-
-# External helper to apply last reviewed results to a df
-def apply_email_enrichment_results(df, overwrite=False):
-    try:
-        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
-        if not results:
-            return 0, "No enrichment results found in session."
-        applied = 0
-        for rec in results:
-            if not rec.get("Approve") or not rec.get("Suggested Email"):
-                continue
-            mask = (
-                (df["First name"].astype(str).str.strip() == str(rec["First name"]).strip()) &
-                (df["Last name"].astype(str).str.strip() == str(rec["Last name"]).strip())
-            )
-            if "Practice Name" in df.columns and str(rec.get("Practice Name","")).strip():
-                mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(rec["Practice Name"]).strip())
-            if overwrite:
-                df.loc[mask, "Email"] = rec["Suggested Email"]
-                applied += int(mask.sum())
-            else:
-                blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
-                df.loc[blanks, "Email"] = rec["Suggested Email"]
-                applied += int(blanks.sum())
-        return applied, "Applied enrichment results from session."
-    except Exception as e:
-        return 0, f"Failed to apply enrichment results: {e}"
 
