@@ -429,55 +429,69 @@ def _enrich_single(row: dict, provider: str, mode: str = "Balanced", logger=None
 
 # --- External helper to apply last reviewed results to a df (persist-safe) ---
 def apply_email_enrichment_results(df, overwrite=False, persist_skip=False):
+    """
+    Apply the currently edited enrichment results from session to `df`.
+    - Writes Email where approved (and either overwrites or only fills blanks).
+    - Marks EnrichStatus = 'approved' for approved rows, 'skipped' for not-approved.
+    - Updates the session skip list; optionally persists it to disk.
+    """
     try:
-        if "EnrichStatus" not in df.columns:
-            df["EnrichStatus"] = ""
-        results = st.session_state.get("_email_enrich_results") or st.session_state.get("_enrich_partial")
+        _ensure_enrichstatus(df)
+
+        results = (st.session_state.get("_email_enrich_results")
+                   or st.session_state.get("_enrich_partial"))
         if not results:
             return 0, "No enrichment results found in session."
+
         applied = 0
-        st.session_state.setdefault("_email_enrich_blacklist", [])
-        blacklist = st.session_state["_email_enrich_blacklist"]
+        # Session skip list (list of [first,last,practice] triplets)
+        bl = st.session_state.setdefault("_email_enrich_blacklist", [])
 
         for rec in results:
-            approved = bool(rec.get("Approve"))
-            suggested = str(rec.get("Suggested Email") or "").strip()
-            fn = rec.get("First name","")
-            ln = rec.get("Last name","")
-            pn = rec.get("Practice Name","")
-            key = list(_row_key3(fn, ln, pn))
+            fn = str(rec.get("First name", "")).strip()
+            ln = str(rec.get("Last name", "")).strip()
+            pn = str(rec.get("Practice Name", "")).strip()
+            suggested = str(rec.get("Suggested Email", "")).strip()
+            approved = bool(rec.get("Approve")) and bool(suggested)
 
-            if approved and suggested:
-                mask = (
-                    (df["First name"].astype(str).str.strip() == str(fn).strip()) &
-                    (df["Last name"].astype(str).str.strip() == str(ln).strip())
-                )
-                if "Practice Name" in df.columns and str(pn).strip():
-                    mask &= (df["Practice Name"].fillna("").astype(str).str.strip() == str(pn).strip())
+            # --- Build the mask ONCE (used in both branches) ---
+            mask = (
+                (df["First name"].astype(str).str.strip() == fn) &
+                (df["Last name"].astype(str).str.strip() == ln)
+            )
+            if "Practice Name" in df.columns and pn:
+                mask = mask & (df["Practice Name"].fillna("").astype(str).str.strip() == pn)
+
+            if approved:
                 if overwrite:
                     df.loc[mask, "Email"] = suggested
                     applied += int(mask.sum())
-                    df.loc[mask, "EnrichStatus"] = "approved"
                 else:
                     blanks = mask & (df["Email"].isna() | (df["Email"].astype(str).str.strip() == ""))
                     df.loc[blanks, "Email"] = suggested
                     applied += int(blanks.sum())
-                    df.loc[mask, "EnrichStatus"] = "approved"
+                df.loc[mask, "EnrichStatus"] = "approved"
             else:
+                # Not approved → mark as skipped and remember in session skip list
                 df.loc[mask, "EnrichStatus"] = "skipped"
-                if key not in blacklist:
-                    blacklist.append(key)
+                key = (fn.lower(), ln.lower(), pn.lower())
+                if list(key) not in bl and key not in bl:
+                    bl.append(key)
 
-        st.session_state["_email_enrich_blacklist"] = blacklist
+        st.session_state["_email_enrich_blacklist"] = bl
 
+        # Optionally persist the skip list to disk
         if persist_skip:
             existing = set(_load_persisted_skiplist())
-            merged = existing.union(set(tuple(x) for x in blacklist))
+            # Normalize to tuples
+            session_keys = {tuple(k) if isinstance(k, (list, tuple)) else tuple(k) for k in bl}
+            merged = existing.union(session_keys)
             _save_persisted_skiplist(list(merged))
 
-        return applied, f"Applied enrichment results. Skipped rows (not approved) now tracked; session skip list size: {len(blacklist)}."
+        return applied, f"Applied enrichment results."
     except Exception as e:
         return 0, f"Failed to apply enrichment results: {e}"
+
 
 # --- Skip list persistence ---
 def _load_persisted_skiplist():
@@ -1051,6 +1065,8 @@ def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False
                     st.warning(f"Could not prepare full dataset downloads: {e}")
     except Exception as e:
         st.warning(f"Could not render results: {e}")
+
+
 
 
 
