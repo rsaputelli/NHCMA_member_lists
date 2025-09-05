@@ -1,4 +1,3 @@
-
 # email_enrichment_util.py — FULL + Live SerpAPI usage (Account API)
 # This build includes everything from the previous drop plus:
 # • Live SerpAPI usage via https://serpapi.com/account.json (free; not counted against quota)
@@ -528,7 +527,6 @@ def _clear_autosave():
 
 # --- UI entry point (sidebar widget) ---
 def email_enrichment_sidebar(df):
-    st.session_state.setdefault(\"_results_rendered\", False)
     st.session_state.setdefault("_results_rendered", False)
     st.caption("Searches public web pages for practice/provider emails. Review suggested emails before applying.")
 
@@ -629,7 +627,6 @@ def email_enrichment_sidebar(df):
         if st.button("Reset skipped list (SESSION)", key="reset_blacklist", type="secondary"):
             st.session_state["_email_enrich_blacklist"] = []
             st.success("Session skip list cleared.")
-
 
     # --- Cross-session restart safety using EnrichStatus column ---
     use_status_skip = st.toggle(
@@ -733,7 +730,6 @@ def email_enrichment_sidebar(df):
     else:
         candidates_df = df[df["Email"].isna() | (df["Email"].astype(str).str.strip() == "")]
 
-
     # Apply EnrichStatus-based skipping
     if "EnrichStatus" in df.columns and use_status_skip:
         status_series = df["EnrichStatus"].astype(str).str.lower().str.strip()
@@ -742,6 +738,7 @@ def email_enrichment_sidebar(df):
         else:
             eligible = status_series.isin(["", "none", "retry"])
         candidates_df = candidates_df[eligible.loc[candidates_df.index]]
+
     # Skip list (session & persisted)
     skip_attempted = st.toggle("Skip already attempted this session", value=True,
                                help="Skips rows you did not approve in prior runs this session (created when you click Apply).")
@@ -767,7 +764,6 @@ def email_enrichment_sidebar(df):
     limit = st.number_input("Max records to scan", min_value=0, max_value=int(max(0, max_limit - start_offset)), value=int(min(default_limit, max(0, max_limit - start_offset))))
     conf_thresh = st.slider("Auto-approve at confidence ≥", 0, 100, 75)
     autosave_every = st.number_input("Autosave every N rows (session)", min_value=1, max_value=100, value=10, step=1)
-
 
     # --- Full dataset persistence on Apply ---
     persist_dataset = st.toggle("Persist full dataset to disk on Apply", value=False,
@@ -993,7 +989,6 @@ def render_email_enrichment_results(df=None, overwrite=False, persist_skip=False
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_results_xlsx_persist",
         )
-
 
         # Full dataset downloads if staged (survives reruns)
         full_csv = st.session_state.get("_last_enriched_csv")
